@@ -5,6 +5,7 @@
 # ///
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
 import asyncio, hashlib, json, os, logging, secrets
+import re
 from collections import Counter, OrderedDict
 
 from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -152,6 +153,289 @@ async def read_pane(pane_id: str, lines: int = 15) -> str:
         return f"(error reading pane: {scrub(e)})"
 
 
+async def fetch_history(pane_id: str, limit: int | None = None) -> dict:
+    """Structured conversation turns from the agent's own transcript via relay.
+
+    The relay parses Claude/Codex/Pi/Kimi JSONL (uuid-keyed, sidechains and
+    thinking dropped), so this has none of the TUI chrome a pane capture
+    carries -- no spinners, no 'Update available' footer, no input box.
+    """
+    limit = limit or HISTORY_TURNS
+    import websockets
+    try:
+        async with websockets.connect(RELAY_WS) as ws:
+            await ws.send(json.dumps({
+                "type": "get_history", "pane_id": pane_id, "limit": limit,
+            }))
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PANE_READ_TIMEOUT
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return {"messages": [], "unavailable": "timeout"}
+                raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
+                msg = json.loads(raw)
+                if msg.get("type") == "history" and msg.get("pane_id") == pane_id:
+                    return msg
+                if msg.get("type") == "error":
+                    return {"messages": [], "unavailable": msg.get("message", "error")}
+    except Exception as e:
+        return {"messages": [], "unavailable": f"error: {scrub(e)}"}
+
+
+HISTORY_TURNS = 6
+HISTORY_TURN_MAX = 2600      # utf-16 units budget for one rendered turn
+HISTORY_VIEW_MAX = 3700      # utf-16 units budget for the whole /read body
+FINISHED_EXCERPT_MAX = 2600  # utf-16 units budget for the finished excerpt
+TG_MSG_MAX = 4096            # Telegram hard cap per message, in utf-16 units
+_HISTORY_ROLE_LABELS = {"user": "you", "assistant": "agent", "note": "note"}
+
+
+def _u16len(s: str) -> int:
+    return len(s.encode("utf-16-le")) // 2
+
+
+def _html_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# --- Agent markdown -> Telegram HTML ---------------------------------------
+#
+# Telegram has no Markdown tables and its MarkdownV2 parser rejects most real
+# agent output, so conversation text is rendered to Telegram's HTML subset
+# (b/i/s/code/pre/a/blockquote). Tables -- the main thing agents use to report
+# numbers -- are turned into per-row labelled lines so CJK cells need no column
+# alignment and stay readable on a phone.
+_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*([\w+-]*)\s*$")
+_FENCE_CLOSE_RE = re.compile(r"^\s*(`{3,}|~{3,})\s*$")
+_HR_RE = re.compile(r"^\s*([-*_])(\s*\1){2,}\s*$")
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_UL_RE = re.compile(r"^(\s*)[-*+]\s+(.*\S)\s*$")
+_OL_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.*\S)\s*$")
+_QUOTE_RE = re.compile(r"^\s*>\s?(.*)$")
+_TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$")
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)\s]+\)")
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+_INLINE_CODE_RE = re.compile(r"``([^`\n]+?)``|`([^`\n]+?)`")
+_BOLD_STAR_RE = re.compile(r"\*\*([^*\n]+?)\*\*")
+# No __bold__: standalone Python dunders in prose would get eaten.
+_STRIKE_RE = re.compile(r"~~([^~\n]+?)~~")
+_ITALIC_STAR_RE = re.compile(r"(?<![\w*])\*([^*\n]+?)\*(?![\w*])")
+_ITALIC_UNDER_RE = re.compile(r"(?<![\w])_([^_\n]+?)_(?![\w])")
+
+
+def _inline_md(text: str) -> str:
+    """Inline markdown -> Telegram HTML. Input is a single line's worth of text."""
+    text = _html_escape(text)
+    text = _IMAGE_RE.sub(lambda m: m.group(1), text)
+    text = _LINK_RE.sub(lambda m: f'<a href="{m.group(2)}">{m.group(1)}</a>', text)
+    # Code spans are stashed while the other markers are rewritten, so markup
+    # inside code (e.g. **kwargs) stays literal.
+    stashed: dict[str, str] = {}
+
+    def _stash(m):
+        token = f"\x00c{len(stashed)}\x00"
+        stashed[token] = "<code>" + (m.group(1) or m.group(2)) + "</code>"
+        return token
+
+    text = _INLINE_CODE_RE.sub(_stash, text)
+    text = _BOLD_STAR_RE.sub(r"<b>\1</b>", text)
+    text = _STRIKE_RE.sub(r"<s>\1</s>", text)
+    text = _ITALIC_STAR_RE.sub(r"<i>\1</i>", text)
+    text = _ITALIC_UNDER_RE.sub(r"<i>\1</i>", text)
+    for token, html in stashed.items():
+        text = text.replace(token, html)
+    return text
+
+
+def _split_table_row(line: str) -> list[str]:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|") and not line.endswith("\\|"):
+        line = line[:-1]
+    return [c.replace("\\|", "|").strip() for c in re.split(r"(?<!\\)\|", line)]
+
+
+def _render_table(header: str, rows: list[str]) -> str:
+    """One block per data row: 'first cell' plus 'header: value' metric lines."""
+    headers = _split_table_row(header)
+    out = []
+    for row in rows:
+        cells = _split_table_row(row)
+        cells += [""] * (len(headers) - len(cells))
+        line = f"▪ {_inline_md(cells[0])}" if cells and cells[0] else "▪"
+        metrics = []
+        for j in range(1, len(cells)):
+            value = _inline_md(cells[j])
+            if not value:
+                continue
+            label = _inline_md(headers[j]) if j < len(headers) and headers[j] else ""
+            metrics.append(f"{label}: {value}" if label else value)
+        if metrics:
+            line += "\n　　" + " ｜ ".join(metrics)
+        out.append(line)
+    return "\n".join(out)
+
+
+def _starts_block(line: str, nxt: str | None) -> bool:
+    if _FENCE_RE.match(line) or _HR_RE.match(line) or _HEADING_RE.match(line):
+        return True
+    if _QUOTE_RE.match(line) or _UL_RE.match(line) or _OL_RE.match(line):
+        return True
+    return nxt is not None and "|" in line and _TABLE_SEP_RE.match(nxt) is not None
+
+
+def _md_blocks(text: str) -> list[str]:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    blocks: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if not line.strip():
+            i += 1
+            continue
+        m = _FENCE_RE.match(line)
+        if m:
+            lang = m.group(2)
+            i += 1
+            buf = []
+            while i < n and not _FENCE_CLOSE_RE.match(lines[i]):
+                buf.append(lines[i])
+                i += 1
+            i += 1  # closing fence (or run off the end)
+            code = _html_escape("\n".join(buf)).strip("\n")
+            inner = (f'<code class="language-{_html_escape(lang)}">{code}</code>'
+                     if lang else f"<code>{code}</code>")
+            blocks.append(f"<pre>{inner}</pre>")
+            continue
+        if i + 1 < n and "|" in line and _TABLE_SEP_RE.match(lines[i + 1]):
+            header = line
+            i += 2
+            rows = []
+            while i < n and lines[i].strip() and "|" in lines[i]:
+                rows.append(lines[i])
+                i += 1
+            blocks.append(_render_table(header, rows))
+            continue
+        m = _HEADING_RE.match(line)
+        if m:
+            blocks.append(f"<b>{_inline_md(m.group(2))}</b>")
+            i += 1
+            continue
+        if _HR_RE.match(line):
+            i += 1
+            continue
+        if _QUOTE_RE.match(line):
+            buf = []
+            while i < n:
+                mq = _QUOTE_RE.match(lines[i])
+                if not mq:
+                    break
+                buf.append(mq.group(1))
+                i += 1
+            blocks.append("<blockquote>" + _inline_md("\n".join(buf)) + "</blockquote>")
+            continue
+        if _UL_RE.match(line) or _OL_RE.match(line):
+            items = []
+            while i < n:
+                mu, mo = _UL_RE.match(lines[i]), _OL_RE.match(lines[i])
+                if mu:
+                    items.append(("•", mu.group(2)))
+                    i += 1
+                elif mo:
+                    items.append((f"{mo.group(2)}.", mo.group(3)))
+                    i += 1
+                elif lines[i].strip() and items:
+                    mark, body = items[-1]
+                    items[-1] = (mark, body + " " + lines[i].strip())
+                    i += 1
+                else:
+                    break
+            blocks.append("\n".join(f"{mark} {_inline_md(body)}" for mark, body in items))
+            continue
+        buf = [line]
+        i += 1
+        while i < n and lines[i].strip() and not _starts_block(
+            lines[i], lines[i + 1] if i + 1 < n else None
+        ):
+            buf.append(lines[i])
+            i += 1
+        blocks.append(_inline_md("\n".join(buf)))
+    return blocks
+
+
+def md_to_html(text: str, max_units: int = HISTORY_TURN_MAX) -> str:
+    """Markdown -> balanced Telegram HTML, tail-truncated to fit the budget."""
+    blocks = _md_blocks(text)
+    for drop in range(len(blocks)):
+        candidate = "\n\n".join(blocks[drop:])
+        if drop:
+            candidate = "<i>(earlier part truncated)</i>\n\n" + candidate
+        if _u16len(candidate) <= max_units:
+            return candidate
+    # One pathological oversized block: degrade to a plain escaped pre tail so
+    # the message still sends instead of failing on length or tag balance.
+    plain = re.sub(r"[*_`~#>]", "", text)
+    while _u16len(plain) > max_units - 80:
+        plain = plain[500:]
+    nl = plain.find("\n")
+    if nl >= 0:
+        plain = plain[nl + 1:]
+    return "<pre>" + _html_escape(plain.strip()) + "</pre>"
+
+
+def render_history(payload: dict) -> str:
+    """Recent turns as Telegram HTML, newest content always surviving the cap."""
+    turns = []
+    for turn in payload.get("messages", []):
+        role = turn.get("role", "")
+        if role == "tool":
+            continue
+        text = (turn.get("text") or "").strip()
+        if not text:
+            continue
+        label = _HISTORY_ROLE_LABELS.get(role, role or "?")
+        turns.append(f"<b>{_html_escape(label)}</b>\n{md_to_html(text)}")
+    kept: list[str] = []
+    used = 0
+    for turn in reversed(turns):
+        cost = _u16len(turn) + (2 if kept else 0)
+        if kept and used + cost > HISTORY_VIEW_MAX:
+            break
+        kept.append(turn)
+        used += cost
+    return "\n\n".join(reversed(kept))
+
+
+async def read_agent(pane_id: str) -> tuple[str, bool]:
+    """(content_html, is_raw_terminal). Transcript first; pane capture as fallback."""
+    history = await fetch_history(pane_id)
+    if history.get("messages") and not history.get("unavailable"):
+        rendered = render_history(history)
+        if rendered:
+            return rendered, False
+    raw = (await read_pane(pane_id))[-3000:]
+    reason = _html_escape(str(history.get("unavailable") or "empty"))
+    return (
+        f"<i>(transcript unavailable: {reason}; showing terminal)</i>\n"
+        f"<pre>{_html_escape(raw)}</pre>",
+        True,
+    )
+
+
+async def last_assistant_excerpt(pane_id: str) -> str:
+    """The agent's final message as HTML, for attaching to a finished notification."""
+    history = await fetch_history(pane_id, limit=8)
+    for turn in reversed(history.get("messages", [])):
+        if turn.get("role") != "assistant":
+            continue
+        text = (turn.get("text") or "").strip()
+        if text:
+            return md_to_html(text, max_units=FINISHED_EXCERPT_MAX)
+    return ""
+
+
 async def send_text_to_relay(pane_id: str, text: str):
     """Send text to an agent using 'herdr agent prompt' for proper submission."""
     if not text or len(text) > 10000:
@@ -212,19 +496,18 @@ async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, 
 
     Repeated /read of the same agent used to post a fresh message each time, so a few commands
     buried the chat in output to scroll past. Editing the previous view instead keeps one message
-    that refreshes -- closer to watching a terminal than reading a log. A monospace block also
-    stops wide output wrapping into an unreadable stack. Falls back to a new message if the old
+    that refreshes -- closer to watching a terminal than reading a log. content arrives as
+    pre-capped, balanced Telegram HTML (rendered transcript, or a <pre> raw-capture fallback),
+    so it must never be tail-sliced here. Falls back to a new message if the old
     one is gone (deleted, or too old for Telegram to edit).
     """
-    if len(content) > READ_VIEW_MAX:
-        content = content[-READ_VIEW_MAX:]
-    text = f"*{_md_escape(header)}*\n{_code_block(content)}"
+    text = f"<b>{_html_escape(header)}</b>\n{content}"
     key = (int(chat_id), pane_id)
     existing = read_views.get(key)
     if existing is not None:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=existing, text=text,
-                                        parse_mode="MarkdownV2")
+                                        parse_mode="HTML")
             return existing
         except Exception as e:
             # Identical output -> "message is not modified": nothing to do, keep the view as is
@@ -233,7 +516,7 @@ async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, 
             if "not modified" in str(e).lower():
                 return existing
             read_views.pop(key, None)
-    sent = await message.reply_text(text, parse_mode="MarkdownV2")
+    sent = await message.reply_text(text, parse_mode="HTML")
     read_views[key] = sent.message_id
     register_pending(chat_id, sent.message_id, pane_id)
     return sent.message_id
@@ -245,6 +528,65 @@ def find_agent(pane_id: str) -> dict | None:
     return matches[0] if len(matches) == 1 else None
 
 
+# --- Identity header: project > pane > claude session ---
+#
+# Every agent on a herdr-projects host reports agent="claude" and often the same
+# cwd basename (thread panes live in .../<slug>/threads/t-NNNN), so the stock
+# "<agent> blocked in <project>" header cannot name the pane. The pieces below
+# rebuild a three-level identity from the agents snapshot:
+#   project -- registered project slug, never the t-NNNN thread dir name
+#   pane    -- live terminal title plus the stable herdr pane id (wT:p29)
+#   session -- the agent's registered herdr name (hp-...-t-NNNN / hpc-...),
+#              falling back to the harness kind (claude/codex/...)
+_HP_THREAD_CWD_RE = re.compile(r"/([^/]+)/threads/t-\d+/?$")
+_HP_WORKTREE_CWD_RE = re.compile(r"/worktrees/[^/]+/hp-([^/]+?)-t-\d+(?:[-/]|$)")
+_HP_NAME_RE = re.compile(r"^hpc?-(.+?)(?:-t-\d+)?$")
+
+
+def effective_project(rec: dict) -> str:
+    cwd = rec.get("cwd") or ""
+    m = _HP_THREAD_CWD_RE.search(cwd)
+    if m:
+        return m.group(1)
+    m = _HP_WORKTREE_CWD_RE.search(cwd)
+    if m:
+        return m.group(1)
+    project = (rec.get("project") or "").strip()
+    # Relay project is basename(cwd); a bare t-NNNN means we are inside a thread
+    # dir whose project slug the relay does not know -- recover it from the
+    # registered session name instead.
+    if project and not re.fullmatch(r"t-\d+", project):
+        return project
+    m = _HP_NAME_RE.match((rec.get("label") or "").strip())
+    if m:
+        return m.group(1)
+    return project or "unknown"
+
+
+def pane_descriptor(rec: dict) -> str:
+    pane_id = rec.get("pane_id") or "?"
+    title = (rec.get("title") or "").strip()
+    return f"{title} ({pane_id})" if title else str(pane_id)
+
+
+def agent_identity(rec: dict) -> str:
+    session = (rec.get("label") or "").strip() or rec.get("agent") or "agent"
+    return " > ".join((effective_project(rec), pane_descriptor(rec), session))
+
+
+def identity_for_blocked(msg: dict) -> str:
+    rec = find_agent(msg.get("pane_id", ""))
+    if rec is not None:
+        return agent_identity(rec)
+    # A blocked message can beat the first agents snapshot after reconnect; use
+    # whatever the blocked message itself carries.
+    return agent_identity({
+        "pane_id": msg.get("pane_id", "?"),
+        "project": msg.get("project", ""),
+        "agent": msg.get("agent", "agent"),
+    })
+
+
 def clear_relay_connection_state():
     global agents, relay_connected
     relay_connected = False
@@ -254,16 +596,17 @@ def clear_relay_connection_state():
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
-    project = agent.get("project") or agent.get("agent") or "agent"
-    parts = [f"{project}:"]
+    # content (when given) is the rendered-transcript HTML from read_agent.
+    title = agent_identity(agent)
+    parts = [f"<b>{_html_escape(title)}</b>"]
     if content is not None:
         parts.extend(["", content])
     parts.extend(["", "Reply to this message to send your response."])
-    kwargs = {}
+    kwargs = {"parse_mode": "HTML"}
     if getattr(chat, "type", None) == "private":
         kwargs["reply_markup"] = ForceReply(
             selective=True,
-            input_field_placeholder=f"Reply to {project}"[:64],
+            input_field_placeholder=f"Reply to {title}"[:64],
         )
     sent = await message.reply_text("\n".join(parts), **kwargs)
     register_pending(chat.id, sent.message_id, agent["pane_id"])
@@ -506,9 +849,9 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No agent matching '{query}'. Use /agents to see list.")
         return
 
-    content = await read_pane(match["pane_id"])
+    content, _is_raw = await read_agent(match["pane_id"])
     await show_pane_view(ctx.bot, update.effective_chat.id, update.message,
-                         match["pane_id"], match["project"], content)
+                         match["pane_id"], agent_identity(match), content)
 
 
 async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -590,9 +933,7 @@ async def cmd_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"No agent matching '{query}'.")
         return
 
-    content = await read_pane(match["pane_id"])
-    if len(content) > 3000:
-        content = content[-3000:]
+    content, _is_raw = await read_agent(match["pane_id"])
     await send_reply_prompt(update.message, update.effective_chat, match, content)
 
 
@@ -727,9 +1068,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
     if action == "read":
-        content = await read_pane(data["pane_id"])
+        content, _is_raw = await read_agent(data["pane_id"])
         await show_pane_view(ctx.bot, update.effective_chat.id, query.message,
-                             data["pane_id"], selected_agent.get("project", ""), content)
+                             data["pane_id"], agent_identity(selected_agent), content)
         return
 
     if action == "interrupt":
@@ -745,9 +1086,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action == "select_reply":
-        content = await read_pane(data["pane_id"])
-        if len(content) > 3000:
-            content = content[-3000:]
+        content, _is_raw = await read_agent(data["pane_id"])
         await send_reply_prompt(query.message, update.effective_chat, selected_agent, content)
         return
 
@@ -968,8 +1307,15 @@ async def notify_blocked(
         if multi
         else "Use an approval button, open the output, or reply to this notification."
     )
+    identity = identity_for_blocked({
+        "pane_id": pane_id, "agent": agent, "project": project,
+    })
+    # Legacy Markdown mode: '*' and '`' are the only metacharacters this header
+    # can contain from terminal titles, strip them rather than risk unbalanced
+    # formatting swallowing the prompt.
+    identity_md = identity.replace("`", "'").replace("*", " ")
     text = (
-        f"*{agent}* blocked in `{project}`\n\n```\n{prompt[:400]}\n```\n\n"
+        f"*{identity_md}* BLOCKED\n\n```\n{prompt[:400]}\n```\n\n"
         f"{instruction}"
     )
     generation = secrets.token_hex(4)
@@ -1046,12 +1392,23 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
 
         if old_status and old_status != new_status and new_status in ("idle", "done") and old_status in ("working", "blocked"):
             try:
+                excerpt = await last_assistant_excerpt(pane_id)
+                # Rendered-transcript HTML: bold/lists/tables come through instead
+                # of raw markdown source. Both branches use HTML consistently.
+                if excerpt:
+                    body = (
+                        f"<b>{_html_escape(agent_identity(agent_data))}</b> finished:\n\n"
+                        f"{excerpt}\n\n"
+                        "Open the full output below, or reply to this notification to send a follow-up."
+                    )
+                else:
+                    body = (
+                        f"<b>{_html_escape(agent_identity(agent_data))}</b> finished.\n\n"
+                        "Open the full output below, or reply to this notification to send a follow-up."
+                    )
                 msg = await app.bot.send_message(
-                    chat_id=int(CHAT_ID),
-                    text=(
-                        f"{agent_data['project']} ({agent_data['agent']}) finished.\n\n"
-                        "Open the output below, or reply to this notification to send a follow-up."
-                    ),
+                    chat_id=int(CHAT_ID), text=body,
+                    parse_mode="HTML",
                     reply_markup=interaction_keyboard(pane_id),
                 )
                 register_pending(int(CHAT_ID), msg.message_id, pane_id)
