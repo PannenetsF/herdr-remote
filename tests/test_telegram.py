@@ -137,6 +137,7 @@ def make_active_approval_keyboard(pane_id, options):
 class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.old_chat_id = tg.CHAT_ID
+        self.old_dashboard_msg_id = tg.dashboard_msg_id
         tg.CHAT_ID = "42"
         tg.agents = []
         tg.relay_connected = False
@@ -146,14 +147,23 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.prev_statuses.clear()
         tg.daily_stats.clear()
         tg.read_views.clear()
+        tg.pane_messages.clear()
+        tg.pane_seen.clear()
+        tg.done_at.clear()
+        tg.dashboard_msg_id = None
+        tg.dash.update(dirty=False, last_push=0.0, last_text=None, last_sig=None)
 
     def tearDown(self):
         tg.CHAT_ID = self.old_chat_id
+        tg.dashboard_msg_id = self.old_dashboard_msg_id
         tg.agents = []
         tg.relay_connected = False
         tg.approval_tokens.clear()
         tg.prev_statuses.clear()
         tg.daily_stats.clear()
+        tg.pane_messages.clear()
+        tg.pane_seen.clear()
+        tg.done_at.clear()
 
     async def test_start_rejects_unauthorized_chat(self):
         update = make_update(chat_id=7)
@@ -168,30 +178,46 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
 
         await tg.cmd_start(update, SimpleNamespace(args=[]))
 
-        self.assertIn("Chat ID: -123", update.message.replies[0][0])
+        self.assertIn("-123", update.message.replies[0][0])
+        self.assertIn("HERDR_TG_CHAT_ID", update.message.replies[0][0])
 
-    async def test_start_reports_disconnected_and_empty_states(self):
+    async def test_start_refreshes_dashboard_without_posting_disconnected_card(self):
+        bot = FakeBot()
         disconnected = make_update()
-        await tg.cmd_start(disconnected, SimpleNamespace(args=[]))
-        self.assertIn("disconnected", disconnected.message.replies[0][0].lower())
-        self.assertNotIn("reply_markup", disconnected.message.replies[0][1])
+        await tg.cmd_start(disconnected, SimpleNamespace(args=[], bot=bot))
+        # No dashboard message exists yet and relay is down: stay silent, just help.
+        self.assertEqual(bot.sent, [])
+        self.assertIn("dashboard", disconnected.message.replies[0][0].lower())
 
         tg.relay_connected = True
         empty = make_update()
-        await tg.cmd_start(empty, SimpleNamespace(args=[]))
-        self.assertIn("no agents", empty.message.replies[0][0].lower())
+        await tg.cmd_start(empty, SimpleNamespace(args=[], bot=bot))
+        # Connected with no panes: the dashboard gets posted to the chat directly.
+        self.assertEqual(len(bot.sent), 1)
+        self.assertIn("no human sessions", bot.sent[0][1].lower())
 
-    async def test_start_lists_current_sixteen_agent_herd(self):
+    async def test_start_dashboard_offers_picker_for_sixteen_agent_herd(self):
         tg.relay_connected = True
         tg.agents = make_agents(16)
+        bot = FakeBot()
         update = make_update()
 
-        await tg.cmd_start(update, SimpleNamespace(args=[]))
+        await tg.cmd_start(update, SimpleNamespace(args=[], bot=bot))
 
-        markup = update.message.replies[0][1]["reply_markup"]
+        # Dashboard collapses 16 idle panes to a count and exposes the picker.
+        _chat, text, kwargs, _msg = bot.sent[0]
+        self.assertIn("16 panes", text)
+        self.assertIn("💤 16 idle", text)
+        dash_buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
+        self.assertEqual([b.text for b in dash_buttons], ["📋 All panes"])
+
+        # The picker behind it still lists all 16 (one page, select_reply).
+        callback = FakeCallback(dash_buttons[0].callback_data)
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        markup = callback.edited_markup
         agent_buttons = [row[0] for row in markup.inline_keyboard if row[0].text not in ("Previous", "Next")]
         self.assertEqual(len(agent_buttons), 16)
-        self.assertTrue(all(tg.parse_callback_data(button.callback_data)["action"] == "select_reply" for button in agent_buttons))
+        self.assertTrue(all(tg.parse_callback_data(b.callback_data)["action"] == "select_reply" for b in agent_buttons))
 
     def test_labels_sort_status_and_disambiguate_duplicate_agents(self):
         agent_list = [
@@ -292,7 +318,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(update.message.replies), 1)          # one message, not two
         self.assertEqual(len(ctx.bot.edits), 1)                    # second read edited it
         self.assertIn("second out", ctx.bot.edits[0][2])
-        self.assertIn("api\\-v2\\.0", ctx.bot.edits[0][2])          # header escaped
+        # pf.1 renders HTML: '>' is escaped, dots in project names stay literal.
+        self.assertIn("api-v2.0 &gt; w0:p1 &gt; opencode", ctx.bot.edits[0][2])
 
     async def test_unchanged_output_does_not_repost(self):
         # Identical output -> Telegram "not modified": keep the view, post nothing new.
@@ -351,7 +378,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.parse_callback_data(send_button.callback_data)["action"], "select_send")
         self.assertEqual(tg.parse_callback_data(reply_button.callback_data)["action"], "select_reply")
 
-    async def test_done_agent_is_listed_and_sends_finished_notification(self):
+    async def test_done_agent_is_listed_but_finish_is_dashboard_only_without_alert(self):
+        tg.relay_connected = True
         tg.agents = make_agents(1, status="done", project="completed")
         update = make_update()
 
@@ -361,14 +389,67 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         app = SimpleNamespace(bot=bot)
         tg.prev_statuses["w0:p1"] = "working"
+        now = tg.time.time()
         await tg.track_agent_updates(app, tg.agents)
-        chat_id, text, kwargs, sent = bot.sent[0]
-        self.assertEqual(chat_id, 42)
-        self.assertIn("completed (opencode) finished", text)
-        button = kwargs["reply_markup"].inline_keyboard[0][0]
-        self.assertEqual(button.text, "Open output & reply")
-        self.assertEqual(tg.parse_callback_data(button.callback_data)["pane_id"], "w0:p1")
-        self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
+        # pf.2: no proactive completion message and no answer text; dashboard only.
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.edits, [])
+        self.assertIn("w0:p1", tg.done_at)
+        self.assertLessEqual(now, tg.done_at["w0:p1"])
+        # The finished pane is what the dashboard renders as a recent ✅ line.
+        dashboard = tg.render_dashboard(tg.done_at["w0:p1"])
+        self.assertIn("✅", dashboard)
+        self.assertIn("completed", dashboard)
+
+    async def test_blocked_alert_is_reused_through_resume_and_finish(self):
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="blocked", project="completed")
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+
+        await tg.notify_blocked(
+            app, "w0:p1", "opencode", "completed", "Allow tool?",
+            ["yes, single permission", "trust, always allow", "no (tab to edit)"],
+            prompt_id="prompt-1",
+        )
+        self.assertEqual(len(bot.sent), 1)
+        message_id = bot.sent[0][3].message_id
+        self.assertEqual(tg.pane_messages["w0:p1"], message_id)
+        self.assertEqual(tg.pending_pane(42, message_id), "w0:p1")
+        # Snapshot tracking runs before the blocked event in the real listener.
+        tg.prev_statuses["w0:p1"] = "blocked"
+
+        # Approval resolves it: the same message is edited into a resume line.
+        tg.agents = make_agents(1, status="working", project="completed")
+        await tg.track_agent_updates(app, tg.agents)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(len(bot.edits), 1)
+        self.assertEqual(bot.edits[0][1], message_id)
+        self.assertIn("working", bot.edits[0][2])
+
+        # Finishing edits the same message again into a ✅ one-liner with buttons.
+        tg.agents = make_agents(1, status="done", project="completed")
+        await tg.track_agent_updates(app, tg.agents)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(len(bot.edits), 2)
+        chat_id, edited_id, text, kwargs = bot.edits[1]
+        self.assertEqual(edited_id, message_id)
+        self.assertIn("finished", text)
+        labels = [b.text for row in kwargs["reply_markup"].inline_keyboard for b in row]
+        self.assertEqual(labels, ["📖 Read", "💬 Reply"])
+        actions = [tg.parse_callback_data(b.callback_data)["action"]
+                   for row in kwargs["reply_markup"].inline_keyboard for b in row]
+        self.assertEqual(actions, ["read", "select_reply"])
+
+        # Re-blocking edits the same card once more, never posts a second alert.
+        tg.agents = make_agents(1, status="blocked", project="completed")
+        await tg.notify_blocked_safely(app, {
+            "pane_id": "w0:p1", "agent": "opencode", "project": "completed",
+            "prompt": "Allow again?", "options": ["yes", "no"], "prompt_id": "prompt-2",
+        })
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(len(bot.edits), 3)
+        self.assertEqual(tg.blocked_prompt_ids["w0:p1"], "prompt-2")
 
     async def test_page_callback_rebuilds_from_latest_cache(self):
         tg.relay_connected = True
@@ -385,13 +466,14 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         button = tg.build_agent_keyboard("select_reply").inline_keyboard[0][0]
         callback = FakeCallback(button.callback_data)
 
-        with patch.object(tg, "read_pane", AsyncMock(return_value="recent output")):
+        with patch.object(tg, "read_agent", AsyncMock(return_value=("recent output", False))):
             await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
 
         text, kwargs, sent = callback.message.replies[0]
         self.assertIn("recent output", text)
         self.assertIsInstance(kwargs["reply_markup"], tg.ForceReply)
-        self.assertEqual(kwargs["reply_markup"].input_field_placeholder, "Reply to project")
+        # pf.1 identity header: project > pane id > session.
+        self.assertTrue(kwargs["reply_markup"].input_field_placeholder.startswith("Reply to project >"))
         self.assertEqual(tg.pending_pane(42, sent.message_id), "w0:p1")
 
     async def test_stale_selection_offers_refresh(self):
@@ -847,6 +929,8 @@ class ApprovalDoubleTapTests(unittest.IsolatedAsyncioTestCase):
         tg.approval_tokens.clear()
         tg.blocked_prompt_ids.clear()
         tg.approval_in_flight.clear()
+        tg.pane_messages.clear()
+        tg.done_at.clear()
 
     def tearDown(self):
         tg.CHAT_ID = self.old_chat_id
@@ -909,20 +993,305 @@ class ApprovalDoubleTapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(send_keys.await_count, 1)
         self.assertIn("older prompt", second_tap.message.replies[0][0].lower())
 
-    async def test_blocked_update_refreshes_prompt_id_without_renotifying(self):
-        tg.blocked_prompt_ids["w0:p1"] = "old"
-        app = SimpleNamespace(bot=FakeBot())
+    async def test_blocked_update_redraws_existing_card_without_new_message(self):
+        bot = FakeBot()
+        app = SimpleNamespace(bot=bot)
+        # A delivered alert exists for w0:p1.
+        await tg.notify_blocked_safely(app, {
+            "type": "blocked", "pane_id": "w0:p1", "agent": "opencode",
+            "project": "project", "prompt": "Allow?", "options": ["yes", "no"],
+            "prompt_id": "old",
+        })
+        self.assertEqual(len(bot.sent), 1)
+        message_id = bot.sent[0][3].message_id
+        generation = tg.approval_tokens["w0:p1"]
 
-        await tg.notify_blocked_safely(
-            app, {"type": "blocked", "pane_id": "w0:p1", "prompt_id": "new", "update": True}
-        )
-        await tg.notify_blocked_safely(
-            app, {"type": "blocked", "pane_id": "w0:p2", "prompt_id": "x", "update": True}
-        )
-
+        # Re-hashed prompt redraws that one message and moves the prompt id;
+        # its approval generation is preserved so the card's buttons stay valid.
+        await tg.notify_blocked_safely(app, {
+            "type": "blocked", "pane_id": "w0:p1", "prompt_id": "new",
+            "prompt": "Allow (updated)?", "options": ["yes", "no"], "update": True,
+        })
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(len(bot.edits), 1)
+        self.assertEqual(bot.edits[0][1], message_id)
+        self.assertIn("Allow (updated)?", bot.edits[0][2])
         self.assertEqual(tg.blocked_prompt_ids["w0:p1"], "new")
-        self.assertNotIn("w0:p2", tg.blocked_prompt_ids)  # never announced: nothing to refresh
-        self.assertEqual(app.bot.sent, [])
+        self.assertEqual(tg.approval_tokens["w0:p1"], generation)
+
+        # An update for a pane that was never announced is a stray: no ghost card.
+        await tg.notify_blocked_safely(app, {
+            "type": "blocked", "pane_id": "w0:p2", "prompt_id": "x", "update": True,
+        })
+        self.assertNotIn("w0:p2", tg.blocked_prompt_ids)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(len(bot.edits), 1)
+
+
+def _rec(pane_id, *, label="", status="idle", project=None, cwd=None,
+         title="", host="local", agent="claude"):
+    return {
+        "pane_id": pane_id,
+        "agent": agent,
+        "label": label,
+        "status": status,
+        "project": project if project is not None else (cwd or "").rsplit("/", 1)[-1],
+        "cwd": cwd or f"/work/{pane_id}",
+        "title": title,
+        "host": host,
+    }
+
+
+def coord_rec(pane_id, slug, *, status="working", n=None, host="local"):
+    return _rec(
+        pane_id, label=f"hpc-{slug}" + (f"-{n}" if n else ""),
+        status=status, project=slug, cwd=f"/Users/me/Documents/{slug}", host=host,
+        title=f"{slug} work",
+    )
+
+
+def thread_rec(pane_id, slug, n, *, status="working", host="local"):
+    t = f"t-{n:04d}"
+    return _rec(
+        pane_id, label=f"hp-{slug}-{t}", status=status, project=t,
+        cwd=f"/Users/me/.herdr-projects/{slug}/threads/{t}", host=host,
+    )
+
+
+class AudienceGateTests(unittest.TestCase):
+    def test_registry_name_patterns(self):
+        self.assertTrue(tg.pane_human(coord_rec("a", "lagrange")))
+        self.assertTrue(tg.pane_human(coord_rec("a", "lagrange", n=2)))
+        self.assertFalse(tg.pane_human(thread_rec("a", "lagrange", 9)))
+
+    def test_thread_cwd_markers_hide_unnamed_workers(self):
+        # Registered-name marker wins over cwd (coordinator inside a thread worktree).
+        coord = _rec("a", label="hpc-x", status="blocked", project="x",
+                     cwd="/repo/worktrees/wt1/hp-x-t-3-checkout")
+        self.assertTrue(tg.pane_human(coord))
+        # Unnamed pane inside a thread worktree is a worker.
+        worker = _rec("b", label="", cwd="/repo/worktrees/wt1/hp-x-t-3-checkout")
+        self.assertFalse(tg.pane_human(worker))
+        # Bare t-NNNN basename without cwd marker still hides.
+        self.assertFalse(tg.pane_human(_rec("c", label="", project="t-17", cwd="/")))
+
+    def test_ordinary_and_remote_sessions_stay_visible(self):
+        self.assertTrue(tg.pane_human(_rec("a", label="", cwd="/work/foo", project="foo")))
+        self.assertTrue(tg.pane_human(coord_rec("a", "lg", host="boe-fyq")))
+
+    def test_agents_for_action_excludes_thread_workers(self):
+        tg.agents = [
+            coord_rec("w:1", "alpha", status="blocked"),
+            thread_rec("w:2", "alpha", 3, status="blocked"),
+            coord_rec("w:3", "beta", status="working"),
+            thread_rec("w:4", "beta", 4, status="working"),
+            _rec("w:5", label="", status="working", project="gamma", cwd="/work/gamma"),
+        ]
+        self.assertEqual({a["pane_id"] for a in tg.agents_for_action("trust")}, {"w:1"})
+        self.assertEqual(
+            {a["pane_id"] for a in tg.agents_for_action("interrupt")},
+            {"w:1", "w:3", "w:5"},
+        )
+        self.assertEqual({a["pane_id"] for a in tg.human_agents()}, {"w:1", "w:3", "w:5"})
+
+
+class ThreadSilenceTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        tg.CHAT_ID = "42"
+        tg.agents = []
+        tg.approval_tokens.clear()
+        tg.blocked_prompt_ids.clear()
+        tg.prev_statuses.clear()
+        tg.done_at.clear()
+        tg.pane_messages.clear()
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+        tg.agents = []
+
+    async def test_thread_blocked_event_is_swallowed(self):
+        tg.agents = [thread_rec("w:1", "alpha", 9, status="blocked")]
+        bot = FakeBot()
+        await tg.notify_blocked_safely(SimpleNamespace(bot=bot), {
+            "pane_id": "w:1", "agent": "claude", "project": "t-0009",
+            "prompt": "Allow?", "options": ["yes", "no"], "prompt_id": "p1",
+        })
+        self.assertEqual(bot.sent, [])
+        self.assertNotIn("w:1", tg.approval_tokens)
+        self.assertNotIn("w:1", tg.blocked_prompt_ids)
+
+    async def test_thread_completion_makes_no_noise(self):
+        tg.agents = [thread_rec("w:1", "alpha", 9, status="done")]
+        tg.prev_statuses["w:1"] = "working"
+        bot = FakeBot()
+        await tg.track_agent_updates(SimpleNamespace(bot=bot), tg.agents)
+        self.assertEqual(bot.sent, [])
+        self.assertEqual(bot.edits, [])
+        self.assertNotIn("w:1", tg.done_at)
+
+
+class DashboardRenderTests(unittest.TestCase):
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        self.old_dashboard_msg_id = tg.dashboard_msg_id
+        tg.CHAT_ID = "42"
+        tg.agents = []
+        tg.relay_connected = True
+        tg.done_at.clear()
+        tg.dashboard_msg_id = None
+        tg.dash.update(dirty=False, last_push=0.0, last_text=None, last_sig=None)
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+        tg.dashboard_msg_id = self.old_dashboard_msg_id
+        tg.agents = []
+        tg.relay_connected = False
+        tg.done_at.clear()
+
+    def test_groups_by_project_with_status_glyphs_and_hidden_workers(self):
+        now = tg.time.time()
+        tg.agents = [
+            coord_rec("w:1", "alpha", status="working"),
+            coord_rec("w:2", "alpha", status="blocked"),
+            thread_rec("w:3", "alpha", 9, status="blocked"),
+            coord_rec("w:4", "zeta", status="done"),
+            _rec("w:5", label="", status="idle", project="zeta", cwd="/work/zeta"),
+        ]
+        tg.done_at["w:4"] = now - 60
+        text = tg.render_dashboard(now)
+
+        # Blocked project sorts before the working-only/idle ones.
+        blocked_at = text.index("alpha")
+        self.assertLess(blocked_at, text.index("zeta"))
+        self.assertIn("🚫", text)
+        self.assertIn("▶️", text)
+        self.assertIn("✅", text)
+        self.assertIn("💤 1 idle", text)
+        # Thread pane never appears by name or id.
+        self.assertNotIn("hp-alpha-t-0009", text)
+        self.assertNotIn("w:3", text)
+        # Identity pieces reach the line: pane descriptor and coordinator name.
+        self.assertIn("hpc-alpha", text)
+
+        markup = tg.build_dashboard_keyboard(now)
+        buttons = [b for row in markup.inline_keyboard for b in row]
+        self.assertTrue(buttons[0].text.startswith("🚫"))
+        self.assertEqual(tg.parse_callback_data(buttons[0].callback_data)["pane_id"], "w:2")
+        self.assertEqual(buttons[-1].text, "📋 All panes")
+
+    def test_stale_done_collapses_into_idle_count(self):
+        now = tg.time.time()
+        tg.agents = [coord_rec("w:4", "zeta", status="done")]
+        tg.done_at["w:4"] = now - tg.DASHBOARD_DONE_TTL - 1
+        text = tg.render_dashboard(now)
+        self.assertNotIn("✅", text)
+        self.assertIn("💤 1 idle", text)
+
+    def test_clock_change_alone_does_not_change_signature(self):
+        tg.agents = [coord_rec("w:1", "alpha", status="working")]
+        a = tg._text_signature(tg.render_dashboard(1_900_000_000))
+        b = tg._text_signature(tg.render_dashboard(1_900_000_300))
+        self.assertEqual(a, b)
+
+
+class DashboardPushTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        self.old_dashboard_msg_id = tg.dashboard_msg_id
+        tg.CHAT_ID = "42"
+        tg.agents = []
+        tg.relay_connected = True
+        tg.done_at.clear()
+        tg.pane_messages.clear()
+        tg.dashboard_msg_id = None
+        tg.dash.update(dirty=False, last_push=0.0, last_text=None, last_sig=None)
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+        tg.dashboard_msg_id = self.old_dashboard_msg_id
+        tg.agents = []
+        tg.relay_connected = False
+        tg.done_at.clear()
+        tg.pane_messages.clear()
+
+    async def test_posts_then_edits_and_reposts_after_delete(self):
+        tg.agents = [coord_rec("w:1", "alpha", status="working")]
+        bot = FakeBot()
+
+        await tg.push_dashboard(bot)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(tg.dashboard_msg_id, bot.sent[0][3].message_id)
+
+        # Identical content within the refresh window: no edit.
+        await tg.push_dashboard(bot)
+        self.assertEqual(bot.edits, [])
+
+        # Force: the same message is edited in place.
+        await tg.push_dashboard(bot, force=True)
+        self.assertEqual(len(bot.edits), 1)
+        self.assertEqual(bot.edits[0][1], tg.dashboard_msg_id)
+
+        # Telegram refuses the edit (user deleted it / aged out): repost fresh.
+        tg.agents = [coord_rec("w:1", "alpha", status="blocked")]
+
+        class EditFailBot(FakeBot):
+            async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+                self.edits.append((chat_id, message_id, text, kwargs))
+                raise Exception("message to edit not found")
+
+        fail_bot = EditFailBot()
+        await tg.push_dashboard(fail_bot, force=True)
+        self.assertEqual(len(fail_bot.sent), 1)
+        self.assertEqual(tg.dashboard_msg_id, fail_bot.sent[0][3].message_id)
+
+
+class StatePersistenceTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
+        self.tmp.close()
+        os.unlink(self.tmp.name)
+        self.old_state = tg.STATE_FILE
+        tg.STATE_FILE = self.tmp.name
+        self.old_dashboard = tg.dashboard_msg_id
+        tg.dashboard_msg_id = None
+
+    def tearDown(self):
+        tg.STATE_FILE = self.old_state
+        tg.dashboard_msg_id = self.old_dashboard
+        tg.pane_messages.clear()
+        tg.done_at.clear()
+        tg.prev_statuses.clear()
+        for path in (self.tmp.name, self.tmp.name + ".tmp"):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+
+    def test_round_trip_dashboard_and_pane_maps(self):
+        now = tg.time.time()
+        tg.pane_messages.clear()
+        tg.done_at.clear()
+        tg.prev_statuses.clear()
+        tg.pane_messages["w:1"] = 77
+        tg.done_at["w:1"] = now - 10
+        tg.prev_statuses["w:1"] = "done"
+        tg.dashboard_msg_id = 99
+        tg.agents = [_rec("w:1", label="hpc-x", status="done", project="x", cwd="/d/x")]
+
+        tg.save_state()
+        self.assertEqual(oct(os.stat(self.tmp.name).st_mode & 0o777), "0o600")
+        # A fresh process loads the same dashboard and message mappings.
+        tg.dashboard_msg_id = None
+        tg.pane_messages.clear()
+        tg.done_at.clear()
+        tg.prev_statuses.clear()
+        tg.load_state()
+        self.assertEqual(tg.dashboard_msg_id, 99)
+        self.assertEqual(tg.pane_messages, {"w:1": 77})
+        self.assertEqual(tg.prev_statuses, {"w:1": "done"})
+        self.assertIn("w:1", tg.done_at)
 
 
 if __name__ == "__main__":

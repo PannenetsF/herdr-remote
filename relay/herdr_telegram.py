@@ -4,7 +4,7 @@
 # dependencies = ["python-telegram-bot>=21.0", "websockets>=14.0"]
 # ///
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
-import asyncio, hashlib, json, os, logging, secrets
+import asyncio, hashlib, json, os, logging, secrets, time
 import re
 from collections import Counter, OrderedDict
 
@@ -23,6 +23,15 @@ CHAT_ID = os.environ.get("HERDR_TG_CHAT_ID", "")
 RELAY_WS = os.environ.get("HERDR_RELAY", "ws://127.0.0.1:8375")
 RELAY_WS_SAFE = RELAY_WS.split("?", 1)[0]  # token-free variant for display and logging; never leak the token
 _RELAY_TOKEN = RELAY_WS.split("token=", 1)[1] if "token=" in RELAY_WS else ""
+
+# Small machine-local JSON (dashboard message id, per-pane message map, recent
+# completion times) so a launchd restart edits the same dashboard instead of
+# posting a new one. Never contains message content or secrets; overwritten
+# atomically with mode 0600.
+STATE_FILE = os.environ.get(
+    "HERDR_TG_STATE",
+    os.path.expanduser("~/.config/herdr-remote/telegram-state.json"),
+)
 
 
 def scrub(value) -> str:
@@ -53,11 +62,28 @@ prev_statuses: dict[str, str] = {}  # pane_id -> last known status
 read_views: dict[tuple[int, str], int] = {}
 relay_connected = False
 daily_stats: dict[str, dict] = {}  # pane_id -> {agent, project, blocked_count, working_mins, last_change}
+# pf.2: a busy herd edits a small fixed set of messages instead of flooding the
+# chat. pane_messages maps each human pane to its ONE reusable notification
+# (blocked alert -> resume one-liner -> finished one-liner); the dashboard is a
+# single auto-refreshing overview message.
+pane_messages: dict[str, int] = {}   # pane_id -> its blocked/finished notification
+pane_seen: dict[str, float] = {}     # pane_id -> last time present in a snapshot
+done_at: dict[str, float] = {}       # pane_id -> completion time (dashboard TTL)
+dashboard_msg_id: int | None = None
+dash = {"dirty": False, "last_push": 0.0, "last_text": None, "last_sig": None}
+state_dirty = False
 
 AGENT_PAGE_SIZE = 20
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
+DASHBOARD_MIN_INTERVAL = 3.0     # fastest cadence of dashboard edits
+DASHBOARD_REFRESH_MAX_AGE = 60.0  # identical dashboards still refresh at this cadence (clock/TTL)
+DASHBOARD_DONE_TTL = 30 * 60     # finished panes stay on the dashboard this long
+DASHBOARD_MAX_LINES = 70         # pane lines before "+N more"
+DASHBOARD_MAX_BLOCK_BUTTONS = 30
+NOTIF_PROMPT_MAX = 1500          # utf-16 units of blocked prompt kept in the <pre> snippet
+PANE_STATE_GRACE = 3600          # vanished panes keep their message map entry this long
 STATUS_ORDER = {"blocked": 0, "working": 1, "done": 2, "idle": 3, "unknown": 3}
 STATUS_LABELS = {"blocked": "BLOCKED", "working": "WORKING", "done": "DONE", "idle": "IDLE", "unknown": "IDLE"}
 ACTION_CODES = {
@@ -186,7 +212,6 @@ async def fetch_history(pane_id: str, limit: int | None = None) -> dict:
 HISTORY_TURNS = 6
 HISTORY_TURN_MAX = 2600      # utf-16 units budget for one rendered turn
 HISTORY_VIEW_MAX = 3700      # utf-16 units budget for the whole /read body
-FINISHED_EXCERPT_MAX = 2600  # utf-16 units budget for the finished excerpt
 TG_MSG_MAX = 4096            # Telegram hard cap per message, in utf-16 units
 _HISTORY_ROLE_LABELS = {"user": "you", "assistant": "agent", "note": "note"}
 
@@ -424,18 +449,6 @@ async def read_agent(pane_id: str) -> tuple[str, bool]:
     )
 
 
-async def last_assistant_excerpt(pane_id: str) -> str:
-    """The agent's final message as HTML, for attaching to a finished notification."""
-    history = await fetch_history(pane_id, limit=8)
-    for turn in reversed(history.get("messages", [])):
-        if turn.get("role") != "assistant":
-            continue
-        text = (turn.get("text") or "").strip()
-        if text:
-            return md_to_html(text, max_units=FINISHED_EXCERPT_MAX)
-    return ""
-
-
 async def send_text_to_relay(pane_id: str, text: str):
     """Send text to an agent using 'herdr agent prompt' for proper submission."""
     if not text or len(text) > 10000:
@@ -474,21 +487,6 @@ def pending_pane(chat_id: int, message_id: int) -> str | None:
 
 
 READ_VIEW_MAX = 3500
-
-
-def _code_block(content: str) -> str:
-    # MarkdownV2 fenced block: inside ```...``` only backslash and backtick need escaping.
-    escaped = content.replace("\\", "\\\\").replace("`", "\\`")
-    return f"```\n{escaped}\n```"
-
-
-_MDV2_SPECIAL = r"_*[]()~`>#+-=|{}.!"
-
-
-def _md_escape(text: str) -> str:
-    # Every MarkdownV2 special outside a code block must be backslash-escaped, or a project name
-    # with a `-` or `.` in it breaks the whole message's parsing.
-    return "".join("\\" + c if c in _MDV2_SPECIAL else c for c in text)
 
 
 async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, content: str):
@@ -587,12 +585,48 @@ def identity_for_blocked(msg: dict) -> str:
     })
 
 
+# --- Human audience: coordinators and manual sessions, never thread workers -
+#
+# Mirrors config/herdr/portal-policy.py's human projection. herdr-projects thread
+# workers are registered as hp-<slug>-t-N (and live in .../<slug>/threads/t-N
+# worktrees): their prompts and completions belong to the coordinator that owns
+# the thread, so they never reach Telegram. Coordinators hpc-<slug>[ -N] and
+# ordinary manually started sessions do; missing markers must not hide a newly
+# started remote session (fail open).
+_HP_THREAD_NAME_RE = re.compile(r"^hp-.+-t-\d+")
+
+
+def pane_human(rec: dict) -> bool:
+    name = (rec.get("label") or "").strip()
+    if name.startswith("hpc-"):
+        return True
+    if _HP_THREAD_NAME_RE.match(name):
+        return False
+    cwd = rec.get("cwd") or ""
+    if _HP_THREAD_CWD_RE.search(cwd) or _HP_WORKTREE_CWD_RE.search(cwd):
+        return False
+    if re.fullmatch(r"t-\d+", (rec.get("project") or "").strip()):
+        return False
+    return True
+
+
+def human_agents(agent_list: list[dict] | None = None) -> list[dict]:
+    return [a for a in (agents if agent_list is None else agent_list) if pane_human(a)]
+
+
+def update_is_human(rec: dict) -> bool:
+    """Audience check for a sparse agent_update: prefer the merged snapshot row."""
+    full = find_agent(rec.get("pane_id", ""))
+    return pane_human(full or rec)
+
+
 def clear_relay_connection_state():
     global agents, relay_connected
     relay_connected = False
     agents = []
     approval_tokens.clear()
     blocked_prompt_ids.clear()
+    mark_dashboard_dirty()
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
@@ -614,11 +648,12 @@ async def send_reply_prompt(message, chat, agent: dict, content: str | None = No
 
 
 def agents_for_action(action: str) -> list[dict]:
+    base = human_agents()
     if action == "interrupt":
-        return [agent for agent in agents if agent.get("status") in ("working", "blocked")]
+        return [agent for agent in base if agent.get("status") in ("working", "blocked")]
     if action == "trust":
-        return [agent for agent in agents if agent.get("status") == "blocked"]
-    return list(agents)
+        return [agent for agent in base if agent.get("status") == "blocked"]
+    return base
 
 
 def sorted_agents(agent_list: list[dict]) -> list[dict]:
@@ -748,71 +783,397 @@ def refresh_keyboard(action: str) -> InlineKeyboardMarkup:
     ]])
 
 
-def dashboard_text() -> str:
+# --- Live dashboard: one auto-refreshing overview message per chat ----------
+#
+# With dozens of panes a notification per event is unreadable. Instead one
+# message is kept at the top of the chat (pin it once via Telegram's UI) and
+# edited in place: panes grouped by project, one status line each, blocked
+# panes get a button straight to the transcript. Finished panes stay for
+# DASHBOARD_DONE_TTL, idle panes collapse into a per-project count.
+STATUS_GLYPH = {"blocked": "🚫", "working": "▶️", "done": "✅", "idle": "💤", "unknown": "💤"}
+
+
+def _u16_truncate(s: str, limit: int) -> str:
+    if _u16len(s) <= limit:
+        return s
+    encoded = s.encode("utf-16-le")[: (limit - 1) * 2]
+    return encoded.decode("utf-16-le", errors="ignore") + "…"
+
+
+def _hhmm(ts: float) -> str:
+    return time.strftime("%H:%M", time.localtime(ts))
+
+
+def _pane_line_label(rec: dict) -> str:
+    """pane descriptor + registered session, plus host for remote panes."""
+    session = (rec.get("label") or "").strip() or rec.get("agent") or "agent"
+    host = rec.get("host") or "local"
+    suffix = f" @{host}" if host != "local" else ""
+    return _u16_truncate(f"{pane_descriptor(rec)} · {session}{suffix}", 150)
+
+
+def _dashboard_groups(now: float) -> "OrderedDict[str, dict]":
+    groups: "OrderedDict[str, dict]" = OrderedDict()
+
+    def bucket(project: str) -> dict:
+        return groups.setdefault(project, {"blocked": [], "working": [], "done": [], "idle": 0})
+
+    for rec in human_agents():
+        project = effective_project(rec)
+        status = rec.get("status", "unknown")
+        row = bucket(project)
+        if status == "blocked":
+            row["blocked"].append(rec)
+        elif status == "working":
+            row["working"].append(rec)
+        elif done_at.get(rec.get("pane_id")) and now - done_at[rec["pane_id"]] <= DASHBOARD_DONE_TTL:
+            row["done"].append(rec)
+        else:
+            row["idle"] += 1
+
+    def group_key(item: tuple[str, dict]) -> tuple:
+        project, row = item
+        if row["blocked"]:
+            rank = 0
+        elif row["working"]:
+            rank = 1
+        elif row["done"]:
+            rank = 2
+        else:
+            rank = 3
+        return (rank, project.lower())
+
+    return OrderedDict(sorted(groups.items(), key=group_key))
+
+
+def render_dashboard(now: float | None = None) -> str:
+    now = time.time() if now is None else now
     if not relay_connected:
-        text = "herdr-remote bot\n\nRelay disconnected. Use /status for connection details."
-    elif not agents:
-        text = "herdr-remote bot\n\nConnected to relay. No agents are running."
-    else:
-        blocked = sum(agent.get("status") == "blocked" for agent in agents)
-        working = sum(agent.get("status") == "working" for agent in agents)
-        done = sum(agent.get("status") == "done" for agent in agents)
-        idle = len(agents) - blocked - working - done
-        text = f"herdr-remote bot\n\nAgents: {len(agents)} ({blocked} blocked, {working} working, {done} done, {idle} idle)\nSelect an agent to read and reply."
-    if not CHAT_ID:
-        text += "\n\nChat ID: {chat_id}"
-    return text
+        return (
+            "🖥 <b>herdr dashboard</b>\n\n"
+            "Relay disconnected — reconnecting automatically. /status for details."
+        )
+    groups = _dashboard_groups(now)
+    if not groups:
+        return "🖥 <b>herdr dashboard</b>\n\nConnected to relay. No human sessions active."
+
+    panes = human_agents()
+    n_blocked = sum(1 for a in panes if a.get("status") == "blocked")
+    n_working = sum(1 for a in panes if a.get("status") == "working")
+    n_done = sum(
+        1 for a in panes
+        if a.get("status") in ("done", "idle", "unknown")
+        and done_at.get(a["pane_id"]) and now - done_at[a["pane_id"]] <= DASHBOARD_DONE_TTL
+    )
+    summary = " ".join(
+        f"{glyph} {n}"
+        for n, glyph in ((n_blocked, "🚫"), (n_working, "▶️"), (n_done, "✅"))
+        if n
+    )
+    lines = [
+        f"🖥 <b>herdr dashboard</b> · {_hhmm(now)} · {len(panes)} panes "
+        f"in {len(groups)} projects" + (f" · {summary}" if summary else "")
+    ]
+
+    def pane_line(rec: dict, glyph: str, bold: bool, when: float | None = None) -> str:
+        label = _html_escape(_pane_line_label(rec))
+        clock = f" · {_hhmm(when)}" if when is not None else ""
+        line = f"{glyph} {label}{clock}"
+        return f"<b>{line}</b>" if bold else line
+
+    budget_lines = DASHBOARD_MAX_LINES
+    hidden = 0
+    for project, row in groups.items():
+        if budget_lines <= 2:
+            hidden += sum(len(row[k]) for k in ("blocked", "working", "done"))
+            continue
+        lines.append(f"\n<b>{_html_escape(project)}</b>")
+        budget_lines -= 1
+        blocked = sorted(row["blocked"], key=lambda a: _pane_line_label(a).lower())
+        working = sorted(row["working"], key=lambda a: _pane_line_label(a).lower())
+        recent = sorted(row["done"], key=lambda a: done_at.get(a["pane_id"], 0), reverse=True)
+        for rec in blocked:
+            if budget_lines <= 1:
+                hidden += 1
+                continue
+            lines.append(pane_line(rec, "🚫", True))
+            budget_lines -= 1
+        for rec in working:
+            if budget_lines <= 1:
+                hidden += 1
+                continue
+            lines.append(pane_line(rec, "▶️", False))
+            budget_lines -= 1
+        for rec in recent:
+            if budget_lines <= 1:
+                hidden += 1
+                continue
+            lines.append(pane_line(rec, "✅", False, done_at.get(rec["pane_id"])))
+            budget_lines -= 1
+        if row["idle"]:
+            if budget_lines <= 1:
+                hidden += row["idle"]
+            else:
+                lines.append(f"💤 {row['idle']} idle")
+                budget_lines -= 1
+    if hidden:
+        lines.append(f"\n<i>… +{hidden} more panes — /agents for the full list</i>")
+    return "\n".join(lines)
+
+
+def _dashboard_block_button(rec: dict) -> str:
+    project = _u16_truncate(effective_project(rec), 24)
+    title = (rec.get("title") or "").strip() or rec.get("pane_id") or "?"
+    session = (rec.get("label") or "").strip()
+    label = f"🚫 {project} · {title}"
+    if session:
+        label += f" · {session}"
+    return _u16_truncate(label, 60)
+
+
+def build_dashboard_keyboard(now: float | None = None) -> InlineKeyboardMarkup:
+    now = time.time() if now is None else now
+    blocked = sorted(
+        (a for a in human_agents() if a.get("status") == "blocked"),
+        key=lambda a: (effective_project(a).lower(), _pane_line_label(a).lower()),
+    )
+    rows = [
+        [InlineKeyboardButton(
+            _dashboard_block_button(rec),
+            callback_data=pane_callback_data("read", rec["pane_id"]),
+        )]
+        for rec in blocked[:DASHBOARD_MAX_BLOCK_BUTTONS]
+    ]
+    rows.append([InlineKeyboardButton(
+        "📋 All panes",
+        callback_data=json.dumps(
+            {"action": "page", "menu": "select_reply", "page": 0}, separators=(",", ":")
+        ),
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def _markup_signature(markup: InlineKeyboardMarkup) -> str:
+    return json.dumps(
+        [[(btn.text, btn.callback_data) for btn in row] for row in markup.inline_keyboard],
+        ensure_ascii=False,
+    )
+
+
+def _text_signature(text: str) -> str:
+    # The header clock must not count as a content change, or every snapshot
+    # edits the message just to move the timestamp.
+    return re.sub(r"· \d\d:\d\d(?= ·|\n)", "· ", text, count=1)
+
+
+def mark_dashboard_dirty():
+    dash["dirty"] = True
+
+
+async def push_dashboard(bot, chat_id: int | None = None, force: bool = False):
+    """Render and edit (or post) the singleton dashboard message."""
+    global dashboard_msg_id, state_dirty
+    target = int(CHAT_ID) if CHAT_ID else (int(chat_id) if chat_id is not None else None)
+    if target is None:
+        return
+    # Never proactively post a "disconnected" dashboard before the first
+    # successful connection; an existing dashboard is still edited to say so.
+    if not relay_connected and dashboard_msg_id is None:
+        dash["dirty"] = False
+        return
+    now = time.time()
+    text = render_dashboard(now)
+    markup = build_dashboard_keyboard(now)
+    sig = (_text_signature(text), _markup_signature(markup))
+    if (
+        not force
+        and dashboard_msg_id is not None
+        and sig == (dash["last_text"], dash["last_sig"])
+        and now - dash["last_push"] < DASHBOARD_REFRESH_MAX_AGE
+    ):
+        dash["dirty"] = False
+        return
+
+    if dashboard_msg_id is not None:
+        try:
+            await bot.edit_message_text(
+                chat_id=target, message_id=dashboard_msg_id, text=text,
+                parse_mode="HTML", reply_markup=markup,
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                pass
+            else:
+                # Deleted by the user or too old to edit: post a fresh one.
+                log.info("dashboard message gone (%s), posting a new one", scrub(e))
+                dashboard_msg_id = None
+
+    if dashboard_msg_id is None:
+        sent = await bot.send_message(
+            chat_id=target, text=text, parse_mode="HTML", reply_markup=markup
+        )
+        dashboard_msg_id = sent.message_id
+        state_dirty = True
+
+    dash.update(last_text=sig[0], last_sig=sig[1], last_push=now, dirty=False)
+
+
+async def dashboard_loop(app: Application):
+    """Coalesce the snapshot stream into edits at most every DASHBOARD_MIN_INTERVAL."""
+    global state_dirty
+    last_save = 0.0
+    while True:
+        await asyncio.sleep(1.0)
+        try:
+            if dash["dirty"] and time.time() - dash["last_push"] >= DASHBOARD_MIN_INTERVAL:
+                await push_dashboard(app.bot)
+            if state_dirty and time.time() - last_save >= 15:
+                save_state()
+                state_dirty = False
+                last_save = time.time()
+        except Exception as e:
+            log.warning("dashboard loop error: %s", scrub(e))
+
+
+def prune_pane_state(now: float, live_panes: set[str]):
+    """Drop bookkeeping for panes that have been absent past the grace window."""
+    global state_dirty
+    for pane_id in [pid for pid, ts in pane_seen.items()
+                    if pid not in live_panes and now - ts > PANE_STATE_GRACE]:
+        pane_messages.pop(pane_id, None)
+        pane_seen.pop(pane_id, None)
+        done_at.pop(pane_id, None)
+        prev_statuses.pop(pane_id, None)
+        daily_stats.pop(pane_id, None)
+        state_dirty = True
+
+
+# --- State persistence (survive launchd restarts, never holds content) ------
+
+def load_state():
+    global dashboard_msg_id
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, OSError, ValueError):
+        return
+    mid = data.get("dashboard_msg_id")
+    if isinstance(mid, int):
+        dashboard_msg_id = mid
+    now = time.time()
+    for pane_id, msg_id in (data.get("pane_messages") or {}).items():
+        if isinstance(pane_id, str) and isinstance(msg_id, int):
+            pane_messages[pane_id] = msg_id
+            pane_seen.setdefault(pane_id, now)
+    for pane_id, ts in (data.get("done_at") or {}).items():
+        if isinstance(ts, (int, float)) and now - float(ts) <= DASHBOARD_DONE_TTL:
+            done_at[str(pane_id)] = float(ts)
+    for pane_id, status in (data.get("statuses") or {}).items():
+        if status in STATUS_ORDER:
+            prev_statuses[str(pane_id)] = status
+
+
+def save_state():
+    try:
+        os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+        live = {a.get("pane_id") for a in agents if a.get("pane_id")}
+        data = {
+            "dashboard_msg_id": dashboard_msg_id,
+            "pane_messages": dict(list(pane_messages.items())[-PENDING_LIMIT:]),
+            "done_at": {
+                pid: ts for pid, ts in done_at.items()
+                if time.time() - ts <= DASHBOARD_DONE_TTL
+            },
+            "statuses": {pid: st for pid, st in prev_statuses.items() if pid in live},
+        }
+        tmp = STATE_FILE + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+        except Exception:
+            os.close(fd)
+            raise
+        os.replace(tmp, STATE_FILE)
+    except OSError as e:
+        log.warning("failed to persist telegram state: %s", scrub(e))
 
 
 # --- Bot commands ---
 
+DASHBOARD_HELP = (
+    "The live dashboard above refreshes on its own — long-press it and Pin so "
+    "it stays at the top of the chat.\n\n"
+    "Blocked sessions post one alert that turns into a ✅ one-liner when they "
+    "finish; tap a row or use /read for the full transcript, or reply to any "
+    "session message to send a follow-up."
+)
+
+
+async def _show_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not CHAT_ID:
+        await update.message.reply_text(
+            f"herdr-remote bot\n\nYour chat id: {update.effective_chat.id}\n"
+            "Set HERDR_TG_CHAT_ID to it to lock the bot to this chat."
+        )
+        return False
+    bot = getattr(ctx, "bot", None)
+    if bot is not None:
+        try:
+            await push_dashboard(bot, chat_id=update.effective_chat.id, force=True)
+        except Exception as e:
+            await update.message.reply_text(f"Dashboard update failed: {scrub(e)}")
+            return False
+    return True
+
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
+    """Handle /start command — bring the singleton dashboard up to date."""
     if not authorized(update):
         return
-    text = dashboard_text()
-    if not CHAT_ID:
-        text = text.format(chat_id=update.effective_chat.id)
-    if relay_connected and agents:
-        await update.message.reply_text(text, reply_markup=build_agent_keyboard("select_reply"))
+    if await _show_dashboard(update, ctx):
+        await update.message.reply_text(DASHBOARD_HELP)
+
+
+async def cmd_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /dashboard — force-refresh (and repost if deleted) the dashboard."""
+    if not authorized(update):
         return
-    await update.message.reply_text(text)
+    if await _show_dashboard(update, ctx):
+        await update.message.reply_text("Dashboard refreshed (pin it to keep it on top).")
 
 
 async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /agents — list current agents with status."""
-    if not agents:
-        await update.message.reply_text("No agents connected." if relay_connected else "Not connected to relay.")
+    """Handle /agents — list current human-facing agents with full identity."""
+    panes = human_agents()
+    if not panes:
+        await update.message.reply_text(
+            "No human sessions connected (thread workers are hidden)."
+            if relay_connected else "Not connected to relay."
+        )
         return
 
-    blocked = [a for a in agents if a.get("status") == "blocked"]
-    working = [a for a in agents if a.get("status") == "working"]
-    done = [a for a in agents if a.get("status") == "done"]
-    idle = [a for a in agents if a.get("status") in ("idle", "unknown")]
-
+    sections = [
+        ("BLOCKED:", lambda a: a.get("status") == "blocked"),
+        ("WORKING:", lambda a: a.get("status") == "working"),
+        ("DONE:", lambda a: a.get("status") == "done"),
+        ("IDLE:", lambda a: a.get("status") in ("idle", "unknown")),
+    ]
     lines = []
-    if blocked:
-        lines.append("BLOCKED:")
-        for a in blocked:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
-            lines.append(f"  {a['project']} ({a['agent']}){host}")
-    if working:
-        lines.append("WORKING:")
-        for a in working:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
-            lines.append(f"  {a['project']} ({a['agent']}){host}")
-    if done:
-        lines.append("DONE:")
-        for a in done:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
-            lines.append(f"  {a['project']} ({a['agent']}){host}")
-    if idle:
-        lines.append("IDLE:")
-        for a in idle:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
-            lines.append(f"  {a['project']} ({a['agent']}){host}")
-
-    await update.message.reply_text("\n".join(lines))
+    for header, pred in sections:
+        rows = sorted(
+            (a for a in panes if pred(a)),
+            key=lambda a: (effective_project(a).lower(), pane_descriptor(a).lower()),
+        )
+        if not rows:
+            continue
+        lines.append(header)
+        for a in rows:
+            lines.append(f"  {agent_identity(a)}")
+    text = "\n".join(lines)
+    if _u16len(text) > TG_MSG_MAX:
+        text = text[: TG_MSG_MAX - 40].rstrip() + "\n… (truncated — use /read <project>)"
+    await update.message.reply_text(text)
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -976,7 +1337,6 @@ async def cmd_digest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No activity recorded yet today.")
         return
 
-    import time
     lines = ["Today's activity:\n"]
     sorted_agents = sorted(daily_stats.values(), key=lambda x: x.get("working_mins", 0), reverse=True)
     for s in sorted_agents:
@@ -1289,6 +1649,58 @@ def interaction_keyboard(pane_id: str) -> InlineKeyboardMarkup:
     ]])
 
 
+def blocked_text(identity: str, prompt: str, multi: bool) -> str:
+    instruction = (
+        "Use the web terminal or manual terminal controls to select multiple options."
+        if multi
+        else "Use an approval button, open the output, or reply to this notification."
+    )
+    snippet = _u16_truncate((prompt or "").strip() or "(no prompt text)", NOTIF_PROMPT_MAX)
+    return (
+        f"🚫 <b>{_html_escape(identity)}</b> BLOCKED\n\n"
+        f"<pre>{_html_escape(snippet)}</pre>\n\n{instruction}"
+    )
+
+
+def resume_text(identity: str, now: float) -> str:
+    return f"▶️ <b>{_html_escape(identity)}</b> working · {_hhmm(now)}"
+
+
+def finished_text(identity: str, now: float) -> str:
+    return f"✅ <b>{_html_escape(identity)}</b> finished · {_hhmm(now)}"
+
+
+def resolved_keyboard(pane_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📖 Read", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton("💬 Reply", callback_data=pane_callback_data("select_reply", pane_id)),
+    ]])
+
+
+async def edit_pane_message(bot, pane_id: str, text: str, markup: InlineKeyboardMarkup) -> bool:
+    """Edit the pane's reusable notification in place.
+
+    Returns False when there is no message to edit or Telegram refuses (deleted
+    / too old), in which case the mapping is dropped so the caller can post a
+    fresh message.
+    """
+    msg_id = pane_messages.get(pane_id)
+    if msg_id is None:
+        return False
+    try:
+        await bot.edit_message_text(
+            chat_id=int(CHAT_ID), message_id=msg_id, text=text,
+            parse_mode="HTML", reply_markup=markup,
+        )
+    except Exception as e:
+        if "not modified" in str(e).lower():
+            return True
+        pane_messages.pop(pane_id, None)
+        mark_state_dirty()
+        return False
+    return True
+
+
 async def notify_blocked(
     app: Application,
     pane_id: str,
@@ -1299,60 +1711,92 @@ async def notify_blocked(
     prompt_id: str | None = None,
     interaction: str | None = None,
     multi: bool = False,
+    generation: str | None = None,
 ):
     if not CHAT_ID:
         return
-    instruction = (
-        "Use the web terminal or manual terminal controls to select multiple options."
-        if multi
-        else "Use an approval button, open the output, or reply to this notification."
-    )
     identity = identity_for_blocked({
         "pane_id": pane_id, "agent": agent, "project": project,
     })
-    # Legacy Markdown mode: '*' and '`' are the only metacharacters this header
-    # can contain from terminal titles, strip them rather than risk unbalanced
-    # formatting swallowing the prompt.
-    identity_md = identity.replace("`", "'").replace("*", " ")
-    text = (
-        f"*{identity_md}* BLOCKED\n\n```\n{prompt[:400]}\n```\n\n"
-        f"{instruction}"
-    )
-    generation = secrets.token_hex(4)
+    text = blocked_text(identity, prompt, multi)
+    generation = generation or secrets.token_hex(4)
     keyboard = make_keyboard(
         pane_id,
         [] if multi else options,
         generation=generation,
         interaction=interaction,
     )
-    msg = await app.bot.send_message(
-        chat_id=int(CHAT_ID), text=text, parse_mode="Markdown", reply_markup=keyboard
-    )
+
+    # Reuse the pane's existing notification across redraws, re-blocks and
+    # resume cycles: one message per pane, edited in place. Only a refused edit
+    # (message deleted / aged out) makes us post fresh.
+    msg_id = pane_messages.get(pane_id)
+    if msg_id is not None:
+        try:
+            await app.bot.edit_message_text(
+                chat_id=int(CHAT_ID), message_id=msg_id, text=text,
+                parse_mode="HTML", reply_markup=keyboard,
+            )
+        except Exception as e:
+            if "not modified" in str(e).lower():
+                approval_tokens[pane_id] = generation
+                if prompt_id:
+                    blocked_prompt_ids[pane_id] = prompt_id
+                return
+            pane_messages.pop(pane_id, None)
+            mark_state_dirty()
+            msg_id = None
+    if msg_id is None:
+        # Raises on transport failure; notify_blocked_safely owns the catch, and
+        # the generation only lands in approval_tokens after success so a failed
+        # send never invalidates the previous prompt's buttons.
+        msg = await app.bot.send_message(
+            chat_id=int(CHAT_ID), text=text, parse_mode="HTML", reply_markup=keyboard
+        )
+        pane_messages[pane_id] = msg.message_id
+        mark_state_dirty()
+        register_pending(int(CHAT_ID), msg.message_id, pane_id)
     approval_tokens[pane_id] = generation
     if prompt_id:
         blocked_prompt_ids[pane_id] = prompt_id
-    register_pending(int(CHAT_ID), msg.message_id, pane_id)
 
 
 async def notify_blocked_safely(app: Application, msg: dict):
+    pane_id = msg.get("pane_id")
+    rec = find_agent(pane_id)
+    # herdr-projects thread workers never page the human: their coordinator
+    # owns the thread. Missing snapshot rows fail open (blocked can win the
+    # race with the first snapshot after reconnect).
+    if rec is not None and not pane_human(rec):
+        return
+
+    kwargs = dict(
+        pane_id=pane_id,
+        agent=msg.get("agent", "unknown"),
+        project=msg.get("project", ""),
+        prompt=msg.get("prompt", ""),
+        options=msg.get("options"),
+        prompt_id=msg.get("prompt_id"),
+        interaction=msg.get("interaction"),
+        multi=bool(msg.get("multi")),
+    )
     if msg.get("update"):
-        # Same blocked streak, re-hashed content: the prompt_id the relay will demand has
-        # moved, so keep ours current or every tap after the redraw fails as "prompt changed".
-        if msg.get("pane_id") in blocked_prompt_ids and msg.get("prompt_id"):
-            blocked_prompt_ids[msg["pane_id"]] = msg["prompt_id"]
+        # Same blocked streak, re-hashed content: the prompt_id the relay will
+        # demand has moved. Edit the existing message in place, keeping its
+        # approval generation so its buttons stay valid. An update with no
+        # delivered message is a stray (the connect preamble announces current
+        # blocks with update=False), so ignore it rather than post a ghost card.
+        if pane_messages.get(pane_id) is None:
+            return
+        try:
+            await notify_blocked(
+                app, generation=approval_tokens.get(pane_id), **kwargs
+            )
+        except Exception as e:
+            log.warning("Failed to redraw blocked notification: %s", scrub(e))
         return
     try:
-        await notify_blocked(
-            app,
-            pane_id=msg["pane_id"],
-            agent=msg.get("agent", "unknown"),
-            project=msg.get("project", ""),
-            prompt=msg.get("prompt", ""),
-            options=msg.get("options"),
-            prompt_id=msg.get("prompt_id"),
-            interaction=msg.get("interaction"),
-            multi=bool(msg.get("multi")),
-        )
+        await notify_blocked(app, **kwargs)
     except Exception as e:
         log.warning("Failed to send blocked notification: %s", scrub(e))
 
@@ -1360,14 +1804,22 @@ async def notify_blocked_safely(app: Application, msg: dict):
 # --- Relay listener ---
 
 async def track_agent_updates(app: Application, updated_agents: list[dict]):
-    """Track status transitions for full snapshots and pane-level updates."""
+    """Track status transitions for full snapshots and pane-level updates.
+
+    pf.2: transitions reuse the pane's single notification message -- the
+    blocked alert becomes a "working" one-liner and then a "finished"
+    one-liner; the full transcript is one button tap away. Completion never
+    posts a new message and never pushes the answer text: the dashboard is the
+    only proactive surface for panes that never blocked.
+    """
     if not CHAT_ID:
         return
 
-    import time
     now = time.time()
     for agent_data in updated_agents:
-        pane_id = agent_data["pane_id"]
+        pane_id = agent_data.get("pane_id")
+        if not pane_id or not update_is_human(agent_data):
+            continue
         new_status = agent_data.get("status", "unknown")
         old_status = prev_statuses.get(pane_id)
 
@@ -1390,31 +1842,32 @@ async def track_agent_updates(app: Application, updated_agents: list[dict]):
             approval_tokens.pop(pane_id, None)
             blocked_prompt_ids.pop(pane_id, None)
 
-        if old_status and old_status != new_status and new_status in ("idle", "done") and old_status in ("working", "blocked"):
+        if old_status and old_status != new_status:
+            identity = agent_identity(agent_data)
             try:
-                excerpt = await last_assistant_excerpt(pane_id)
-                # Rendered-transcript HTML: bold/lists/tables come through instead
-                # of raw markdown source. Both branches use HTML consistently.
-                if excerpt:
-                    body = (
-                        f"<b>{_html_escape(agent_identity(agent_data))}</b> finished:\n\n"
-                        f"{excerpt}\n\n"
-                        "Open the full output below, or reply to this notification to send a follow-up."
+                if new_status == "working" and old_status == "blocked":
+                    # Approval resolved: the blocked alert collapses to a resume line.
+                    await edit_pane_message(
+                        app.bot, pane_id, resume_text(identity, now),
+                        interaction_keyboard(pane_id),
                     )
-                else:
-                    body = (
-                        f"<b>{_html_escape(agent_identity(agent_data))}</b> finished.\n\n"
-                        "Open the full output below, or reply to this notification to send a follow-up."
+                elif new_status in ("idle", "done") and old_status in ("working", "blocked"):
+                    done_at[pane_id] = now
+                    mark_state_dirty()
+                    await edit_pane_message(
+                        app.bot, pane_id, finished_text(identity, now),
+                        resolved_keyboard(pane_id),
                     )
-                msg = await app.bot.send_message(
-                    chat_id=int(CHAT_ID), text=body,
-                    parse_mode="HTML",
-                    reply_markup=interaction_keyboard(pane_id),
-                )
-                register_pending(int(CHAT_ID), msg.message_id, pane_id)
+                if new_status in ("working", "blocked"):
+                    done_at.pop(pane_id, None)
             except Exception as e:
-                log.warning("Failed to send completion notification: %s", scrub(e))
+                log.warning("Failed to update pane notification: %s", scrub(e))
         prev_statuses[pane_id] = new_status
+
+
+def mark_state_dirty():
+    global state_dirty
+    state_dirty = True
 
 
 async def relay_listener(app: Application):
@@ -1427,6 +1880,7 @@ async def relay_listener(app: Application):
             async with websockets.connect(RELAY_WS) as ws:
                 relay_connected = True
                 log.info(f"Connected to relay at {RELAY_WS_SAFE}")
+                mark_dashboard_dirty()
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
@@ -1445,15 +1899,27 @@ async def relay_listener(app: Application):
                                 blocked_prompt_ids.pop(pane_id, None)
                         await track_agent_updates(app, new_agents)
                         agents = apply_agent_message(agents, msg)
+                        now = time.time()
+                        live_panes = set()
+                        for a in agents:
+                            pid = a.get("pane_id")
+                            if pid:
+                                pane_seen[pid] = now
+                                live_panes.add(pid)
+                        prune_pane_state(now, live_panes)
+                        mark_dashboard_dirty()
 
                     elif msg.get("type") == "agent_update":
                         updated_agent = msg.get("agent") or {}
                         if updated_agent.get("pane_id"):
                             await track_agent_updates(app, [updated_agent])
                             agents = apply_agent_message(agents, msg)
+                            pane_seen[updated_agent["pane_id"]] = time.time()
+                            mark_dashboard_dirty()
 
                     elif msg.get("type") == "blocked":
                         await notify_blocked_safely(app, msg)
+                        mark_dashboard_dirty()
                 clear_relay_connection_state()
         except Exception as e:
             clear_relay_connection_state()
@@ -1471,6 +1937,7 @@ def main():
         auth_filter = filters.ALL  # No restriction in discovery mode
 
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard, filters=auth_filter))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))
@@ -1486,10 +1953,15 @@ def main():
     asyncio.set_event_loop(loop)
 
     async def run():
+        load_state()
         async with app:
             await app.start()
             await app.updater.start_polling()
-            await relay_listener(app)
+            dashboard_task = asyncio.create_task(dashboard_loop(app))
+            try:
+                await relay_listener(app)
+            finally:
+                dashboard_task.cancel()
 
     loop.run_until_complete(run())
 
