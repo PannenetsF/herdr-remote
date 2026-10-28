@@ -85,7 +85,6 @@ bar = {"dirty": True, "last_push": 0.0, "sig": None}
 state_dirty = False
 
 AGENT_PAGE_SIZE = 20
-SWITCH_PAGE_SIZE = 10             # rows per /switch page, group headers included
 RECENT_MAX = 8                    # recent panes persisted in the state file
 RECENT_BAR_SLOTS = 3              # recent panes shown on the persistent bar
 BAR_MIN_INTERVAL = 1.0            # fastest cadence of silent bar refreshes
@@ -1073,9 +1072,13 @@ async def dashboard_loop(app: Application):
 # handle_text and never forwarded to a pane.
 
 def _bar_short_identity(rec: dict) -> str:
-    """project › session, compact enough for a phone-width key."""
+    """project › session, compact enough for a phone-width key.
+
+    Own-project coordinators collapse to "coord" (same rule as /switch rows),
+    otherwise the slug is printed twice.
+    """
     project = effective_project(rec)
-    session = (rec.get("label") or "").strip() or rec.get("agent") or "agent"
+    session = _short_session(rec, project)
     return _u16_truncate(f"{project} › {session}", 34)
 
 
@@ -1213,11 +1216,23 @@ def bar_label_pane(text: str) -> tuple[str, str | None]:
     return "", None
 
 
-# --- /switch: project-grouped focus selector --------------------------------
+# --- /switch: project-tagged focus selector --------------------------------
+#
+# pf.4: the project lives inside every pane row (a ▸ header row scrolls away on
+# a phone), hpc-<own project> coordinator names collapse to "coord" so the row
+# is not twice the same slug, and the four status chips stay short enough for
+# one phone-width row.
 
+SWITCH_PAGE_SIZE = 10             # pane rows per /switch page
+SWITCH_LABEL_LIMIT = 80           # u16 units for a full-width phone button
+SWITCH_PROJECT_LIMIT = 16
+SWITCH_SESSION_LIMIT = 18
+SWITCH_HOST_LIMIT = 16
 SWITCH_FILTERS = ("all", "blocked", "working", "idle")
-SWITCH_FILTER_LABELS = {"all": "全部", "blocked": "🚫 blocked",
-                        "working": "▶️ working", "idle": "💤 idle/done"}
+SWITCH_FILTER_LABELS = {"all": "全部", "blocked": "🚫 待处理",
+                        "working": "▶️ 运行", "idle": "💤 空闲"}
+
+_HPC_COORD_SUFFIX_RE = re.compile(r"^(.+)-(\d+)$")
 
 
 def _switch_cb(**kw) -> str:
@@ -1242,48 +1257,80 @@ def switch_matches(rec: dict, statusf: str, query: str) -> bool:
     return True
 
 
-def _switch_flat(statusf: str, query: str) -> list[tuple[str, object]]:
-    """[("h", project), ("p", rec), ...] grouped by project, status-ranked."""
+def _switch_panes(statusf: str, query: str) -> list[dict]:
+    """Matching human panes, grouped by effective project.
+
+    Iteration follows the status ranking (so the first group holds the most
+    urgent panes) and panes stay grouped within each project — without header
+    rows, the project tag is part of every pane label.
+    """
     groups: "OrderedDict[str, list[dict]]" = OrderedDict()
     for rec in sorted_agents(human_agents()):
         if not switch_matches(rec, statusf, query):
             continue
         groups.setdefault(effective_project(rec), []).append(rec)
-    flat: list[tuple[str, object]] = []
-    for project, recs in groups.items():
-        flat.append(("h", project))
-        for rec in recs:
-            flat.append(("p", rec))
-    return flat
+    return [rec for recs in groups.values() for rec in recs]
+
+
+def _short_session(rec: dict, project: str) -> str:
+    """Session token for a compact row label.
+
+    A coordinator registered as hpc-<slug> duplicates the project tag at the
+    start of the row; collapse it to "coord" (coord-2/...). Registered names
+    mirror Rust names.rs truncation: 24 chars standalone, 22 before the -N
+    suffix. Anything else keeps its full (pre-capped) name.
+    """
+    session = (rec.get("label") or "").strip() or rec.get("agent") or "agent"
+    if session.startswith("hpc-"):
+        rest = session[4:]
+        if rest in (project, project[:24]):
+            return "coord"
+        m = _HPC_COORD_SUFFIX_RE.match(rest)
+        if m and m.group(1) in (project, project[:22]):
+            return "coord" if m.group(2) == "1" else f"coord-{m.group(2)}"
+    return session
 
 
 def _switch_pane_label(rec: dict) -> str:
-    status = rec.get("status", "unknown")
-    return _u16_truncate(
-        f"{STATUS_GLYPH.get(status, '💤')} {_pane_line_label(rec)}", 60
+    """glyph project › title (pane) · session @host with component-aware cut.
+
+    Phone clients truncate a button by pixels regardless of our char cap, so
+    the free-form title is the only component we ever shorten: project,
+    session and host are pre-capped and the pane id is always intact — every
+    row stays resolvable to an exact pane.
+    """
+    project = effective_project(rec)
+    glyph = STATUS_GLYPH.get(rec.get("status", "unknown"), "💤")
+    head = f"{glyph} {_u16_truncate(project, SWITCH_PROJECT_LIMIT)} › "
+    session = _u16_truncate(_short_session(rec, project), SWITCH_SESSION_LIMIT)
+    host = rec.get("host") or "local"
+    host_part = (
+        f" @{_u16_truncate(host, SWITCH_HOST_LIMIT)}" if host != "local" else ""
     )
+    pane_id = str(rec.get("pane_id") or "?")
+    title = (rec.get("title") or "").strip()
+    tail = f"({pane_id}) · {session}{host_part}"
+    room = SWITCH_LABEL_LIMIT - _u16len(head) - _u16len(tail) - 1  # space
+    if title and room >= 6:
+        desc = f"{_u16_truncate(title, room)} ({pane_id})"
+    else:
+        desc = pane_id
+    return f"{head}{desc} · {session}{host_part}"
 
 
 def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") -> InlineKeyboardMarkup:
     if statusf not in SWITCH_FILTERS:
         statusf = "all"
     query = query[:24]
-    flat = _switch_flat(statusf, query)
-    page_count = max(1, (len(flat) + SWITCH_PAGE_SIZE - 1) // SWITCH_PAGE_SIZE)
+    panes = _switch_panes(statusf, query)
+    page_count = max(1, (len(panes) + SWITCH_PAGE_SIZE - 1) // SWITCH_PAGE_SIZE)
     page = min(max(page, 0), page_count - 1)
-    visible = flat[page * SWITCH_PAGE_SIZE:(page + 1) * SWITCH_PAGE_SIZE]
+    visible = panes[page * SWITCH_PAGE_SIZE:(page + 1) * SWITCH_PAGE_SIZE]
 
-    keyboard = []
-    for kind, payload in visible:
-        if kind == "h":
-            keyboard.append([InlineKeyboardButton(
-                f"▸ {payload}", callback_data=_switch_cb(action="noop")
-            )])
-        else:
-            keyboard.append([InlineKeyboardButton(
-                _switch_pane_label(payload),
-                callback_data=pane_callback_data("switch", payload["pane_id"]),
-            )])
+    keyboard = [[InlineKeyboardButton(
+        _switch_pane_label(rec),
+        callback_data=pane_callback_data("switch", rec["pane_id"]),
+    )] for rec in visible]
 
     keyboard.append([
         InlineKeyboardButton(
@@ -1470,14 +1517,14 @@ async def cmd_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /switch [query] — project-grouped focus selector."""
+    """Handle /switch [query] — project-tagged focus selector."""
     if not authorized(update):
         return
     query = " ".join(ctx.args or []).strip()
     if not relay_connected and not human_agents():
         await update.message.reply_text("Relay disconnected. Use /switch after it reconnects.")
         return
-    flat = _switch_flat("all", query)
+    flat = _switch_panes("all", query)
     if not flat:
         await update.message.reply_text(
             "没有匹配的人类 session（thread worker 已隐藏）。"

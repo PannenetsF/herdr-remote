@@ -1281,7 +1281,7 @@ class DashboardPushTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
-    """pf.3: sticky focus pane, persistent bar, /switch selector."""
+    """pf.3: sticky focus pane, persistent bar, /switch selector; pf.4: rows."""
 
     def setUp(self):
         self.old_chat_id = tg.CHAT_ID
@@ -1410,9 +1410,12 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         send_text.assert_not_awaited()
         _text, kwargs = message.replies[0][0], message.replies[0][1]
         buttons = self._flatten(kwargs["reply_markup"])
-        projects = {b.text for b in buttons if b.text.startswith("▸")}
-        self.assertIn("▸ lagrange", projects)
-        self.assertIn("▸ nix-hm", projects)
+        labels = [b.text for b in buttons
+                  if tg.parse_callback_data(b.callback_data).get("action") == "switch"]
+        # pf.4: project tag lives on the pane rows themselves, no ▸ headers.
+        self.assertTrue(any("lagrange" in t for t in labels))
+        self.assertTrue(any("nix-hm" in t for t in labels))
+        self.assertFalse(any(t.startswith("▸") for t in labels))
 
     async def test_plain_text_routes_to_focus_with_identity_receipt(self):
         self._herd()
@@ -1558,12 +1561,16 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         self._herd()
         markup = tg.build_switch_keyboard()
         flat = self._flatten(markup)
-        headers = [b.text for b in flat if b.text.startswith("▸")]
-        self.assertIn("▸ lagrange", headers)
-        self.assertIn("▸ nix-hm", headers)
+        pane_btns = [b for b in flat
+                     if tg.parse_callback_data(b.callback_data).get("action") == "switch"]
+        # pf.4: no header rows; each pane row carries its own project tag.
+        self.assertFalse(any(b.text.startswith("▸") for b in flat))
+        labels = {tg.parse_callback_data(b.callback_data)["pane_id"]: b.text
+                  for b in pane_btns}
+        self.assertIn("lagrange", labels["wT:pA"])
+        self.assertIn("nix-hm", labels["wT:pB"])
         # worker pane absent
-        self.assertNotIn("wT:pC", [tg.parse_callback_data(b.callback_data).get("pane_id")
-                                    for b in flat])
+        self.assertNotIn("wT:pC", labels)
 
         blocked = tg.build_switch_keyboard(statusf="blocked")
         bflat = self._flatten(blocked)
@@ -1587,14 +1594,71 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         for markup in (first, second):
             for b in self._flatten(markup):
                 self.assertLessEqual(len(b.callback_data.encode()), 64, b.callback_data)
-        # header+pane rows within page budget on page 0
+        # pane rows within page budget on page 0 (filters + nav add at most 2)
         pane_rows = [b for b in self._flatten(first)
                      if tg.parse_callback_data(b.callback_data).get("action") == "switch"]
-        self.assertLessEqual(len(first.inline_keyboard), tg.SWITCH_PAGE_SIZE + 3)
+        self.assertLessEqual(len(first.inline_keyboard), tg.SWITCH_PAGE_SIZE + 2)
+        self.assertEqual(len(pane_rows), tg.SWITCH_PAGE_SIZE)
         self.assertTrue(pane_rows)
         # Next button exists and carries page 1
         nav = next(b for b in self._flatten(first) if b.text == "Next")
         self.assertEqual(json.loads(nav.callback_data)["page"], 1)
+
+    # --- pf.4: project-tagged rows, coord collapse, short filter chips -----
+
+    def _switch_rows(self, markup):
+        return [b for b in self._flatten(markup)
+                if tg.parse_callback_data(b.callback_data).get("action") == "switch"]
+
+    def test_own_project_coordinator_collapses_to_coord(self):
+        tg.agents = [
+            coord_rec("w:1", "lagrange-system"),
+            _rec("w:2", label="hpc-lagrange-system-2", project="lagrange-system",
+                 cwd="/u/lagrange-system"),
+            _rec("w:3", label="hpc-other-project", project="lagrange-system",
+                 cwd="/u/lagrange-system"),
+        ]
+        labels = {
+            tg.parse_callback_data(b.callback_data)["pane_id"]: b.text
+            for b in self._switch_rows(tg.build_switch_keyboard())
+        }
+        self.assertTrue(labels["w:1"].endswith("· coord"))
+        self.assertIn("· coord-2", labels["w:2"])
+        self.assertIn("hpc-other-project", labels["w:3"])
+        # every row still starts glyph + the row's project tag
+        for text in labels.values():
+            self.assertIn("lagrange-system › ", text)
+
+    def test_short_session_handles_namesrs_truncated_names(self):
+        long_slug = "a-very-long-project-slug-indeed"  # 29 chars
+        r1 = _rec("w:1", label=f"hpc-{long_slug[:24]}", project=long_slug, cwd=f"/u/{long_slug}")
+        r2 = _rec("w:2", label=f"hpc-{long_slug[:22]}-2", project=long_slug, cwd=f"/u/{long_slug}")
+        self.assertEqual(tg._short_session(r1, long_slug), "coord")
+        self.assertEqual(tg._short_session(r2, long_slug), "coord-2")
+
+    def test_long_title_is_the_only_component_cut(self):
+        title = "x" * 200
+        rec = _rec("wT:pZZ", label="hpc-nix-hm", status="working",
+                   project="nix-hm", cwd="/u/nix-hm", title=title, host="boe-fyq")
+        label = tg._switch_pane_label(rec)
+        self.assertTrue(label.endswith("(wT:pZZ) · coord @boe-fyq"))
+        self.assertTrue(label.startswith("▶️ nix-hm › "))
+        self.assertLessEqual(tg._u16len(label), tg.SWITCH_LABEL_LIMIT)
+
+    def test_filter_chips_are_short_and_one_row(self):
+        self._herd()
+        markup = tg.build_switch_keyboard(statusf="blocked")
+        chip_rows = [row for row in markup.inline_keyboard
+                     if all("action" in tg.parse_callback_data(b.callback_data)
+                            and tg.parse_callback_data(b.callback_data).get("action") == "switch-filter"
+                            for b in row)]
+        self.assertEqual(len(chip_rows), 1)
+        self.assertEqual([b.text for b in chip_rows[0]],
+                         ["○ 全部", "● 🚫 待处理", "○ ▶️ 运行", "○ 💤 空闲"])
+
+    def test_remote_host_is_visible_on_row(self):
+        rec = coord_rec("w:1", "lagrange", host="boe-fyq")
+        self.assertIn("@boe-fyq", tg._switch_pane_label(rec))
 
     async def test_switch_menu_and_filter_callbacks_rebuild_keyboard(self):
         self._herd()
