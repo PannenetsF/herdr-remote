@@ -28,10 +28,17 @@ def _telegram_stubs():
         def __init__(self, **kwargs):
             self.kwargs = kwargs
 
+    class ReplyKeyboardMarkup:
+        def __init__(self, keyboard, **kwargs):
+            self.keyboard = keyboard
+            self.kwargs = kwargs
+            self.input_field_placeholder = kwargs.get("input_field_placeholder")
+
     telegram.Update = object
     telegram.ForceReply = ForceReply
     telegram.InlineKeyboardButton = InlineKeyboardButton
     telegram.InlineKeyboardMarkup = InlineKeyboardMarkup
+    telegram.ReplyKeyboardMarkup = ReplyKeyboardMarkup
 
     ext = types.ModuleType("telegram.ext")
     ext.Application = object

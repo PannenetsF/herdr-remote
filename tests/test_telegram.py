@@ -86,6 +86,10 @@ class FakeBot:
         if self.fail:
             raise Exception("message to edit not found")
 
+    async def delete_message(self, chat_id, message_id):
+        self.deleted = getattr(self, "deleted", [])
+        self.deleted.append((chat_id, message_id))
+
 
 class FakeRelayConnection:
     def __init__(self, responses):
@@ -134,6 +138,12 @@ def make_active_approval_keyboard(pane_id, options):
     return markup
 
 
+def reset_focus_state():
+    tg.active_pane = None
+    tg.recent_panes.clear()
+    tg.bar.update(dirty=False, last_push=0.0, sig=None)
+
+
 class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.old_chat_id = tg.CHAT_ID
@@ -150,6 +160,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.pane_messages.clear()
         tg.pane_seen.clear()
         tg.done_at.clear()
+        reset_focus_state()
         tg.dashboard_msg_id = None
         tg.dash.update(dirty=False, last_push=0.0, last_text=None, last_sig=None)
 
@@ -164,6 +175,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.pane_messages.clear()
         tg.pane_seen.clear()
         tg.done_at.clear()
+        reset_focus_state()
 
     async def test_start_rejects_unauthorized_chat(self):
         update = make_update(chat_id=7)
@@ -185,16 +197,20 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         disconnected = make_update()
         await tg.cmd_start(disconnected, SimpleNamespace(args=[], bot=bot))
-        # No dashboard message exists yet and relay is down: stay silent, just help.
-        self.assertEqual(bot.sent, [])
+        # No dashboard while relay is down; only the (immediately deleted)
+        # persistent-bar placeholder goes out, so nothing visible remains.
+        visible = [s for s in bot.sent if s[1] != "\u200b"]
+        self.assertEqual(visible, [])
+        self.assertTrue(bot.deleted)
         self.assertIn("dashboard", disconnected.message.replies[0][0].lower())
 
         tg.relay_connected = True
         empty = make_update()
         await tg.cmd_start(empty, SimpleNamespace(args=[], bot=bot))
         # Connected with no panes: the dashboard gets posted to the chat directly.
-        self.assertEqual(len(bot.sent), 1)
-        self.assertIn("no human sessions", bot.sent[0][1].lower())
+        posted = [s for s in bot.sent if s[1] != "\u200b"]
+        self.assertEqual(len(posted), 1)
+        self.assertIn("no human sessions", posted[0][1].lower())
 
     async def test_start_dashboard_offers_picker_for_sixteen_agent_herd(self):
         tg.relay_connected = True
@@ -205,7 +221,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         await tg.cmd_start(update, SimpleNamespace(args=[], bot=bot))
 
         # Dashboard collapses 16 idle panes to a count and exposes the picker.
-        _chat, text, kwargs, _msg = bot.sent[0]
+        posted = [s for s in bot.sent if s[1] != "\u200b"]
+        _chat, text, kwargs, _msg = posted[0]
         self.assertIn("16 panes", text)
         self.assertIn("💤 16 idle", text)
         dash_buttons = [b for row in kwargs["reply_markup"].inline_keyboard for b in row]
@@ -800,7 +817,18 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
             await tg.handle_text(make_update(message=message), SimpleNamespace())
 
         send_text.assert_awaited_once_with("w0:p1", "follow up")
-        self.assertEqual(message.replies[0][0], "Sent")
+        # pf.3 receipt carries the full identity and Read/switch controls, and
+        # replying to the card also focuses that pane for later plain messages.
+        receipt, receipt_kwargs = message.replies[0][0], message.replies[0][1]
+        self.assertIn("已发送", receipt)
+        self.assertIn("project &gt; w0:p1 &gt; opencode", receipt)
+        self.assertEqual(tg.active_pane, "w0:p1")
+        self.assertEqual(tg.recent_panes[0], "w0:p1")
+        receipt_actions = [
+            tg.parse_callback_data(b.callback_data)["action"]
+            for row in receipt_kwargs["reply_markup"].inline_keyboard for b in row
+        ]
+        self.assertEqual(receipt_actions, ["read", "switch-open"])
 
     async def test_blocked_notification_reply_uses_prompt_response(self):
         tg.relay_connected = True
@@ -931,10 +959,12 @@ class ApprovalDoubleTapTests(unittest.IsolatedAsyncioTestCase):
         tg.approval_in_flight.clear()
         tg.pane_messages.clear()
         tg.done_at.clear()
+        reset_focus_state()
 
     def tearDown(self):
         tg.CHAT_ID = self.old_chat_id
         tg.approval_in_flight.clear()
+        reset_focus_state()
 
     def _tap(self, markup):
         callback = FakeCallback(markup.inline_keyboard[0][0].callback_data)
@@ -1105,10 +1135,12 @@ class ThreadSilenceTests(unittest.IsolatedAsyncioTestCase):
         tg.prev_statuses.clear()
         tg.done_at.clear()
         tg.pane_messages.clear()
+        reset_focus_state()
 
     def tearDown(self):
         tg.CHAT_ID = self.old_chat_id
         tg.agents = []
+        reset_focus_state()
 
     async def test_thread_blocked_event_is_swallowed(self):
         tg.agents = [thread_rec("w:1", "alpha", 9, status="blocked")]
@@ -1204,6 +1236,7 @@ class DashboardPushTests(unittest.IsolatedAsyncioTestCase):
         tg.relay_connected = True
         tg.done_at.clear()
         tg.pane_messages.clear()
+        reset_focus_state()
         tg.dashboard_msg_id = None
         tg.dash.update(dirty=False, last_push=0.0, last_text=None, last_sig=None)
 
@@ -1214,6 +1247,7 @@ class DashboardPushTests(unittest.IsolatedAsyncioTestCase):
         tg.relay_connected = False
         tg.done_at.clear()
         tg.pane_messages.clear()
+        reset_focus_state()
 
     async def test_posts_then_edits_and_reposts_after_delete(self):
         tg.agents = [coord_rec("w:1", "alpha", status="working")]
@@ -1246,6 +1280,376 @@ class DashboardPushTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.dashboard_msg_id, fail_bot.sent[0][3].message_id)
 
 
+class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
+    """pf.3: sticky focus pane, persistent bar, /switch selector."""
+
+    def setUp(self):
+        self.old_chat_id = tg.CHAT_ID
+        tg.CHAT_ID = "42"
+        tg.agents = []
+        tg.relay_connected = True
+        tg.pending.clear()
+        tg.approval_tokens.clear()
+        tg.blocked_prompt_ids.clear()
+        tg.prev_statuses.clear()
+        tg.pane_messages.clear()
+        tg.done_at.clear()
+        reset_focus_state()
+
+    def tearDown(self):
+        tg.CHAT_ID = self.old_chat_id
+        tg.agents = []
+        tg.relay_connected = False
+        reset_focus_state()
+
+    def _herd(self):
+        # two projects, a thread worker that must never appear, an unnamed session
+        tg.agents = [
+            coord_rec("wT:pA", "lagrange", status="working"),
+            coord_rec("wT:pB", "nix-hm", status="blocked"),
+            thread_rec("wT:pC", "lagrange", 3, status="blocked"),
+            _rec("wT:pD", label="", status="idle", project="dot-nvim",
+                 cwd="/work/dot-nvim", title="nvim tweaks", agent="claude"),
+        ]
+
+    def _flatten(self, markup):
+        return [b for row in markup.inline_keyboard for b in row]
+
+    def _bar_texts(self, markup):
+        # Real PTB reply-keyboard rows hold KeyboardButton objects, not strings.
+        return [b.text for row in markup.keyboard for b in row]
+
+    # --- bar markup -------------------------------------------------------
+
+    def test_bar_without_focus_has_only_static_keys(self):
+        self._herd()
+        markup = tg.build_bar_markup()
+        flat = self._bar_texts(markup)
+        self.assertEqual(flat, [tg.BAR_SWITCH_LABEL, tg.BAR_DASHBOARD_LABEL])
+        self.assertIn("先选", markup.input_field_placeholder)
+
+    def test_bar_active_and_recents_hide_workers_and_dead_panes(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        tg.focus_pane("wT:pB")
+        active_item, recent_items = tg._bar_specs()
+        self.assertEqual(active_item[1]["pane_id"], "wT:pB")
+        self.assertEqual([r["pane_id"] for _l, r in recent_items], ["wT:pA"])
+        markup = tg.build_bar_markup()
+        flat = self._bar_texts(markup)
+        self.assertTrue(flat[0].startswith("🎯"))
+        self.assertTrue(any(b.startswith("🔄") for b in flat))
+        self.assertIn(tg.BAR_UNFOCUS_LABEL, flat)
+        self.assertIn("消息发往", markup.input_field_placeholder)
+
+        # A thread-worker id that snuck into focus/recent (never via the bar,
+        # but be defensive) renders as no active row and never as a recent key.
+        tg.focus_pane("wT:pC")
+        active_item, recent_items = tg._bar_specs()
+        self.assertIsNone(active_item)
+        self.assertTrue(all(r["pane_id"] != "wT:pC" for _l, r in recent_items))
+        flat = self._bar_texts(tg.build_bar_markup())
+        self.assertNotIn("hp-lagrange-t-0003", " ".join(flat))
+
+    def test_dead_active_pane_renders_without_active_row(self):
+        self._herd()
+        tg.active_pane = "gone:pane"
+        tg.recent_panes = ["gone:pane", "wT:pA"]
+        active_item, recent_items = tg._bar_specs()
+        self.assertIsNone(active_item)
+        self.assertEqual([r["pane_id"] for _l, r in recent_items], ["wT:pA"])
+
+    def test_duplicate_identities_get_pane_id_suffix(self):
+        tg.agents = [
+            _rec("w:1", label="", status="idle", project="same", cwd="/work/same", agent="claude"),
+            _rec("w:2", label="", status="idle", project="same", cwd="/work/same", agent="claude"),
+        ]
+        tg.focus_pane("w:1")
+        tg.focus_pane("w:2")
+        markup = tg.build_bar_markup()
+        flat = self._bar_texts(markup)
+        self.assertEqual(len([b for b in flat if "w:1" in b]), 1)
+        self.assertEqual(len([b for b in flat if "w:2" in b]), 1)
+
+    async def test_refresh_bar_silently_sends_and_deletes_placeholder(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        bot = FakeBot()
+        await tg.refresh_bar(bot)
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(bot.sent[0][1], "\u200b")
+        self.assertEqual(bot.deleted, [(42, bot.sent[0][3].message_id)])
+        # Signature-gated: a second refresh does nothing.
+        await tg.refresh_bar(bot)
+        self.assertEqual(len(bot.sent), 1)
+        # Focus change forces a new keyboard.
+        tg.focus_pane("wT:pB")
+        await tg.refresh_bar(bot, force=True)
+        self.assertEqual(len(bot.sent), 2)
+
+    async def test_refresh_bar_is_noop_without_chat_lock(self):
+        tg.CHAT_ID = ""
+        bot = FakeBot()
+        await tg.refresh_bar(bot)
+        self.assertEqual(bot.sent, [])
+
+    # --- free text routing ------------------------------------------------
+
+    async def test_plain_text_without_focus_opens_selector_sends_nothing(self):
+        self._herd()
+        message = FakeMessage()
+        message.text = "hello any session"
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        send_text.assert_not_awaited()
+        _text, kwargs = message.replies[0][0], message.replies[0][1]
+        buttons = self._flatten(kwargs["reply_markup"])
+        projects = {b.text for b in buttons if b.text.startswith("▸")}
+        self.assertIn("▸ lagrange", projects)
+        self.assertIn("▸ nix-hm", projects)
+
+    async def test_plain_text_routes_to_focus_with_identity_receipt(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        message = FakeMessage()
+        message.text = "继续"
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        send_text.assert_awaited_once_with("wT:pA", "继续")
+        receipt, kwargs = message.replies[0][0], message.replies[0][1]
+        self.assertIn("lagrange", receipt)
+        self.assertIn("hpc-lagrange", receipt)
+        self.assertIn("wT:pA", receipt)
+        actions = [tg.parse_callback_data(b.callback_data)["action"]
+                   for b in self._flatten(kwargs["reply_markup"])]
+        self.assertEqual(actions, ["read", "switch-open"])
+
+    async def test_blocked_focus_uses_prompt_response_path(self):
+        self._herd()
+        tg.focus_pane("wT:pB")
+        tg.blocked_prompt_ids["wT:pB"] = "prompt-9"
+        message = FakeMessage()
+        message.text = "yes"
+        with (
+            patch.object(tg, "send_to_relay", AsyncMock()) as send_response,
+            patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text,
+        ):
+            await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        send_response.assert_awaited_once_with("wT:pB", "yes", prompt_id="prompt-9")
+        send_text.assert_not_awaited()
+
+    async def test_reply_to_card_overrides_focus_and_redirects(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        tg.register_pending(42, 77, "wT:pB")
+        message = FakeMessage()
+        message.reply_to_message = SimpleNamespace(message_id=77)
+        message.text = "answer on B"
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        send_text.assert_awaited_once_with("wT:pB", "answer on B")
+        self.assertEqual(tg.active_pane, "wT:pB")
+        self.assertEqual(tg.recent_panes[0], "wT:pB")
+
+    async def test_stale_focus_is_cleared_and_selector_offered(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        tg.agents = [a for a in tg.agents if a["pane_id"] != "wT:pA"]
+        message = FakeMessage()
+        message.text = "anyone there"
+        bot = FakeBot()
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(message=message), make_context(bot=bot))
+        send_text.assert_not_awaited()
+        self.assertIsNone(tg.active_pane)
+        self.assertIn("no longer available", message.replies[0][0].lower())
+        self.assertTrue(message.replies[0][1].get("reply_markup"))
+
+    async def test_group_chat_keeps_reply_only_contract(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        message = FakeMessage(chat_type="group")
+        message.text = "ungrouped text"
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(chat_type="group", message=message),
+                                 make_context(bot=FakeBot()))
+        send_text.assert_not_awaited()
+        self.assertEqual(message.replies, [])
+
+    # --- bar label taps ---------------------------------------------------
+
+    async def test_bar_label_taps_never_reach_a_pane(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        tg.recent_panes = ["wT:pB", "wT:pA"]
+        _active, recents = tg._bar_specs()
+        recent_label = "🔄 " + recents[0][0]
+        # exact active label from the current markup
+        active_label = [t for t in self._bar_texts(tg.build_bar_markup())
+                        if t.startswith("🎯")][0]
+        labels = (tg.BAR_SWITCH_LABEL, tg.BAR_DASHBOARD_LABEL,
+                  active_label, recent_label, tg.BAR_UNFOCUS_LABEL)
+        tapped = []
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            for label in labels:
+                message = FakeMessage()
+                message.text = label
+                tapped.append((label, message))
+                await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        send_text.assert_not_awaited()
+        # Every tap produced some feedback, none routed text to a pane.
+        self.assertTrue(all(m.replies for _label, m in tapped))
+        self.assertTrue(any("dashboard" in r[0].lower()
+                            for _l, m in tapped for r in m.replies))
+
+    async def test_unfocus_tap_clears_active(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        message = FakeMessage()
+        message.text = tg.BAR_UNFOCUS_LABEL
+        await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        self.assertIsNone(tg.active_pane)
+        self.assertIn("取消", message.replies[0][0])
+
+    async def test_recent_tap_refocuses_and_prompts(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        tg.focus_pane("wT:pB")
+        # A is now a recent key; find its exact label.
+        _active, recents = tg._bar_specs()
+        label = "🔄 " + recents[0][0]
+        message = FakeMessage()
+        message.text = label
+        await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        self.assertEqual(tg.active_pane, recents[0][1]["pane_id"])
+        self.assertIn("已聚焦", message.replies[0][0])
+        self.assertIsInstance(message.replies[0][1]["reply_markup"], tg.ForceReply)
+
+    # --- /switch selector --------------------------------------------------
+
+    async def test_switch_selection_focuses_and_followup_text_routes(self):
+        self._herd()
+        button = tg.build_switch_keyboard().inline_keyboard
+        # find the lagrange coordinator pane row (skip headers)
+        pane_buttons = [row[0] for row in button
+                        if tg.parse_callback_data(row[0].callback_data).get("action") == "switch"]
+        target = next(b for b in pane_buttons
+                      if tg.parse_callback_data(b.callback_data)["pane_id"] == "wT:pA")
+        callback = FakeCallback(target.callback_data)
+        await tg.handle_callback(make_update(callback=callback), make_context(bot=FakeBot()))
+
+        self.assertEqual(tg.active_pane, "wT:pA")
+        self.assertEqual(tg.recent_panes[0], "wT:pA")
+        self.assertIn("已聚焦", callback.message.replies[0][0])
+
+        follow = FakeMessage()
+        follow.text = "do the thing"
+        with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
+            await tg.handle_text(make_update(message=follow), make_context(bot=FakeBot()))
+        send_text.assert_awaited_once_with("wT:pA", "do the thing")
+
+    def test_switch_keyboard_groups_and_filters(self):
+        self._herd()
+        markup = tg.build_switch_keyboard()
+        flat = self._flatten(markup)
+        headers = [b.text for b in flat if b.text.startswith("▸")]
+        self.assertIn("▸ lagrange", headers)
+        self.assertIn("▸ nix-hm", headers)
+        # worker pane absent
+        self.assertNotIn("wT:pC", [tg.parse_callback_data(b.callback_data).get("pane_id")
+                                    for b in flat])
+
+        blocked = tg.build_switch_keyboard(statusf="blocked")
+        bflat = self._flatten(blocked)
+        pane_ids = {tg.parse_callback_data(b.callback_data).get("pane_id")
+                    for b in bflat if tg.parse_callback_data(b.callback_data).get("action") == "switch"}
+        self.assertEqual(pane_ids, {"wT:pB"})
+
+        found = tg.build_switch_keyboard(query="nvim")
+        ids = {tg.parse_callback_data(b.callback_data).get("pane_id")
+               for b in self._flatten(found)
+               if tg.parse_callback_data(b.callback_data).get("action") == "switch"}
+        self.assertEqual(ids, {"wT:pD"})
+
+    def test_switch_filters_paginate_and_all_callbacks_fit_bytes(self):
+        tg.agents = [
+            coord_rec(f"w:p{i:02d}", f"proj-{i % 4}", status=("blocked" if i % 3 == 0 else "working"))
+            for i in range(tg.SWITCH_PAGE_SIZE * 2 + 3)
+        ]
+        first = tg.build_switch_keyboard(page=0)
+        second = tg.build_switch_keyboard(page=1, query="proj")
+        for markup in (first, second):
+            for b in self._flatten(markup):
+                self.assertLessEqual(len(b.callback_data.encode()), 64, b.callback_data)
+        # header+pane rows within page budget on page 0
+        pane_rows = [b for b in self._flatten(first)
+                     if tg.parse_callback_data(b.callback_data).get("action") == "switch"]
+        self.assertLessEqual(len(first.inline_keyboard), tg.SWITCH_PAGE_SIZE + 3)
+        self.assertTrue(pane_rows)
+        # Next button exists and carries page 1
+        nav = next(b for b in self._flatten(first) if b.text == "Next")
+        self.assertEqual(json.loads(nav.callback_data)["page"], 1)
+
+    async def test_switch_menu_and_filter_callbacks_rebuild_keyboard(self):
+        self._herd()
+        nav = tg._switch_cb(action="switch-menu", page=0, f="blocked", q="")
+        callback = FakeCallback(nav)
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        ids = {tg.parse_callback_data(b.callback_data).get("pane_id")
+               for b in self._flatten(callback.edited_markup)
+               if tg.parse_callback_data(b.callback_data).get("action") == "switch"}
+        self.assertEqual(ids, {"wT:pB"})
+
+    async def test_group_header_noop_callback_does_nothing(self):
+        callback = FakeCallback({"action": "noop"})
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        self.assertEqual(callback.message.replies, [])
+
+    async def test_switch_open_receipt_button_posts_selector(self):
+        self._herd()
+        callback = FakeCallback({"action": "switch-open"})
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        text, kwargs, _sent = callback.message.replies[0]
+        self.assertIn("选择", text)
+        self.assertTrue(kwargs["reply_markup"].inline_keyboard)
+
+    async def test_stale_switch_pane_reports_offline(self):
+        self._herd()
+        button = tg.pane_callback_data("switch", "gone:p1")
+        callback = FakeCallback(button)
+        await tg.handle_callback(make_update(callback=callback), SimpleNamespace())
+        self.assertIn("no longer available", callback.message.replies[0][0].lower())
+
+    async def test_find_command_requires_keyword(self):
+        update = make_update()
+        await tg.cmd_find(update, make_context(args=[]))
+        self.assertIn("用法", update.message.replies[0][0])
+
+    # --- pruning / recent bookkeeping -------------------------------------
+
+    def test_recent_list_is_mru_bounded(self):
+        ids = [f"w:p{i}" for i in range(tg.RECENT_MAX + 3)]
+        for pid in ids:
+            tg.focus_pane(pid)
+        self.assertEqual(len(tg.recent_panes), tg.RECENT_MAX)
+        self.assertEqual(tg.recent_panes[0], ids[-1])
+        # re-focusing an old pane moves it to front without duplication
+        tg.focus_pane(ids[2])
+        self.assertEqual(tg.recent_panes[0], ids[2])
+        self.assertEqual(tg.recent_panes.count(ids[2]), 1)
+
+    def test_prune_clears_active_and_recent_entries(self):
+        tg.focus_pane("w:dead")
+        tg.recent_panes.append("w:alive")
+        now = tg.time.time()
+        tg.pane_seen["w:dead"] = now - tg.PANE_STATE_GRACE - 10
+        tg.pane_seen["w:alive"] = now
+        tg.prune_pane_state(now, {"w:alive"})
+        self.assertIsNone(tg.active_pane)
+        self.assertNotIn("w:dead", tg.recent_panes)
+        self.assertIn("w:alive", tg.recent_panes)
+
+
 class StatePersistenceTests(unittest.TestCase):
     def setUp(self):
         import tempfile
@@ -1263,6 +1667,7 @@ class StatePersistenceTests(unittest.TestCase):
         tg.pane_messages.clear()
         tg.done_at.clear()
         tg.prev_statuses.clear()
+        reset_focus_state()
         for path in (self.tmp.name, self.tmp.name + ".tmp"):
             try:
                 os.unlink(path)

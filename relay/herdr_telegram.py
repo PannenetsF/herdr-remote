@@ -8,7 +8,13 @@ import asyncio, hashlib, json, os, logging, secrets, time
 import re
 from collections import Counter, OrderedDict
 
-from telegram import ForceReply, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    ForceReply,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ReplyKeyboardMarkup,
+)
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, ContextTypes, filters
 
 from agent_state import apply_agent_message
@@ -71,9 +77,21 @@ pane_seen: dict[str, float] = {}     # pane_id -> last time present in a snapsho
 done_at: dict[str, float] = {}       # pane_id -> completion time (dashboard TTL)
 dashboard_msg_id: int | None = None
 dash = {"dirty": False, "last_push": 0.0, "last_text": None, "last_sig": None}
+# pf.3: one sticky focus pane. Plain text goes to it without a Telegram reply;
+# recent panes fill the persistent bottom bar for one-tap switching.
+active_pane: str | None = None
+recent_panes: list[str] = []
+bar = {"dirty": True, "last_push": 0.0, "sig": None}
 state_dirty = False
 
 AGENT_PAGE_SIZE = 20
+SWITCH_PAGE_SIZE = 10             # rows per /switch page, group headers included
+RECENT_MAX = 8                    # recent panes persisted in the state file
+RECENT_BAR_SLOTS = 3              # recent panes shown on the persistent bar
+BAR_MIN_INTERVAL = 1.0            # fastest cadence of silent bar refreshes
+BAR_SWITCH_LABEL = "📋 切换 session"
+BAR_DASHBOARD_LABEL = "📊 Dashboard"
+BAR_UNFOCUS_LABEL = "✖ 取消聚焦"
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
@@ -93,6 +111,7 @@ ACTION_CODES = {
     "select_reply": "q",
     "trust": "t",
     "approval": "k",
+    "switch": "u",
 }
 CODE_ACTIONS = {code: action for action, code in ACTION_CODES.items()}
 
@@ -627,6 +646,7 @@ def clear_relay_connection_state():
     approval_tokens.clear()
     blocked_prompt_ids.clear()
     mark_dashboard_dirty()
+    mark_bar_dirty()
 
 
 async def send_reply_prompt(message, chat, agent: dict, content: str | None = None):
@@ -1027,6 +1047,8 @@ async def dashboard_loop(app: Application):
         try:
             if dash["dirty"] and time.time() - dash["last_push"] >= DASHBOARD_MIN_INTERVAL:
                 await push_dashboard(app.bot)
+            if bar["dirty"] and time.time() - bar["last_push"] >= BAR_MIN_INTERVAL:
+                await refresh_bar(app.bot)
             if state_dirty and time.time() - last_save >= 15:
                 save_state()
                 state_dirty = False
@@ -1035,9 +1057,291 @@ async def dashboard_loop(app: Application):
             log.warning("dashboard loop error: %s", scrub(e))
 
 
+# --- Persistent bottom bar + sticky focus pane (pf.3) -----------------------
+#
+# A ReplyKeyboardMarkup lives above the input box independently of any message,
+# so it is the only Telegram primitive that can hold always-available session
+# controls. It is swapped silently: a zero-width-space message carrying the new
+# markup is sent and deleted at once (the keyboard itself survives the delete),
+# signature-gated so snapshots cannot spam the chat. Tapping a key sends its
+# label as an ordinary text message; those labels are intercepted in
+# handle_text and never forwarded to a pane.
+
+def _bar_short_identity(rec: dict) -> str:
+    """project › session, compact enough for a phone-width key."""
+    project = effective_project(rec)
+    session = (rec.get("label") or "").strip() or rec.get("agent") or "agent"
+    return _u16_truncate(f"{project} › {session}", 34)
+
+
+def _bar_specs() -> tuple[dict | None, list[tuple[str, dict]]]:
+    """Live (active rec, [(short label, rec), ...]) for the bar; dead panes drop."""
+    live = {a.get("pane_id"): a for a in human_agents() if a.get("pane_id")}
+    active = live.get(active_pane) if active_pane else None
+
+    picked: list[dict] = []
+    seen = {active_pane} if active_pane else set()
+    for pane_id in recent_panes:
+        if pane_id in seen:
+            continue
+        rec = live.get(pane_id)
+        if rec is None:
+            continue
+        picked.append(rec)
+        seen.add(pane_id)
+        if len(picked) >= RECENT_BAR_SLOTS:
+            break
+
+    # Duplicate project › session names (unnamed harnesses) get the pane id so
+    # a label always resolves to exactly one pane.
+    bases = ([(active, _bar_short_identity(active))] if active else []) + [
+        (rec, _bar_short_identity(rec)) for rec in picked
+    ]
+    counts = Counter(label for _rec, label in bases)
+    labelled = [
+        (label if counts[label] == 1 else f"{label} · {rec.get('pane_id')}", rec)
+        for rec, label in bases
+    ]
+    active_item = (labelled[0][0], labelled[0][1]) if active else None
+    recent_items = [(label, rec) for label, rec in labelled[1 if active else 0:]]
+    return active_item, recent_items
+
+
+def build_bar_markup() -> ReplyKeyboardMarkup | None:
+    if not CHAT_ID:
+        return None
+    active_item, recent_items = _bar_specs()
+    rows: list[list[str]] = []
+    if active_item is not None:
+        rows.append(["🎯 " + active_item[0]])
+    for label, _rec in recent_items:
+        rows.append(["🔄 " + label])
+    last = [BAR_SWITCH_LABEL, BAR_DASHBOARD_LABEL]
+    if active_item is not None:
+        last.append(BAR_UNFOCUS_LABEL)
+    rows.append(last)
+    if active_item is not None:
+        placeholder = _u16_truncate("消息发往 " + agent_identity(active_item[1]), 63)
+    else:
+        placeholder = "先选 session，再直接发消息"
+    return ReplyKeyboardMarkup(
+        rows,
+        resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder=placeholder,
+    )
+
+
+def _bar_signature(markup: ReplyKeyboardMarkup | None) -> str:
+    if markup is None:
+        return ""
+    return json.dumps(
+        {"k": [[btn.text for btn in row] for row in markup.keyboard],
+         "p": markup.input_field_placeholder},
+        ensure_ascii=False,
+    )
+
+
+def mark_bar_dirty():
+    bar["dirty"] = True
+
+
+async def refresh_bar(bot, force: bool = False):
+    """Swap the persistent keyboard silently via a deleted placeholder message."""
+    if not CHAT_ID or bot is None:
+        bar["dirty"] = False
+        return
+    markup = build_bar_markup()
+    sig = _bar_signature(markup)
+    if not force and sig == bar["sig"]:
+        bar["dirty"] = False
+        return
+    chat_id = int(CHAT_ID)
+    try:
+        sent = await bot.send_message(chat_id, "\u200b", reply_markup=markup)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
+        except Exception:
+            pass
+        bar["sig"] = sig
+        bar["last_push"] = time.time()
+    except Exception as e:
+        log.warning("failed to refresh session bar: %s", scrub(e))
+    bar["dirty"] = False
+
+
+def focus_pane(pane_id: str):
+    """Make pane_id the sticky target and promote it in the recent list."""
+    global active_pane, state_dirty
+    active_pane = pane_id
+    if pane_id in recent_panes:
+        recent_panes.remove(pane_id)
+    recent_panes.insert(0, pane_id)
+    del recent_panes[RECENT_MAX:]
+    bar["dirty"] = True
+    state_dirty = True
+
+
+def unfocus_pane():
+    global active_pane, state_dirty
+    if active_pane is not None:
+        active_pane = None
+        state_dirty = True
+    bar["dirty"] = True
+
+
+def bar_label_pane(text: str) -> tuple[str, str | None]:
+    """Classify a tapped bottom-bar label: (kind, pane_id)."""
+    active_item, recent_items = _bar_specs()
+    active_label = "🎯 " + active_item[0] if active_item else None
+    recent_map = {"🔄 " + label: rec.get("pane_id") for label, rec in recent_items}
+    if text == BAR_SWITCH_LABEL:
+        return "switch", None
+    if text == BAR_DASHBOARD_LABEL:
+        return "dashboard", None
+    if text == BAR_UNFOCUS_LABEL:
+        return "unfocus", None
+    if active_label and text == active_label:
+        return "active", active_pane
+    if text in recent_map:
+        return "recent", recent_map[text]
+    return "", None
+
+
+# --- /switch: project-grouped focus selector --------------------------------
+
+SWITCH_FILTERS = ("all", "blocked", "working", "idle")
+SWITCH_FILTER_LABELS = {"all": "全部", "blocked": "🚫 blocked",
+                        "working": "▶️ working", "idle": "💤 idle/done"}
+
+
+def _switch_cb(**kw) -> str:
+    return json.dumps(kw, separators=(",", ":"))
+
+
+def switch_matches(rec: dict, statusf: str, query: str) -> bool:
+    status = rec.get("status", "unknown")
+    if statusf == "blocked" and status != "blocked":
+        return False
+    if statusf == "working" and status != "working":
+        return False
+    if statusf == "idle" and status not in ("idle", "done", "unknown"):
+        return False
+    if query:
+        haystack = " ".join((
+            effective_project(rec), rec.get("title", ""), rec.get("label", ""),
+            rec.get("agent", ""), rec.get("pane_id", ""),
+        )).lower()
+        if query.lower() not in haystack:
+            return False
+    return True
+
+
+def _switch_flat(statusf: str, query: str) -> list[tuple[str, object]]:
+    """[("h", project), ("p", rec), ...] grouped by project, status-ranked."""
+    groups: "OrderedDict[str, list[dict]]" = OrderedDict()
+    for rec in sorted_agents(human_agents()):
+        if not switch_matches(rec, statusf, query):
+            continue
+        groups.setdefault(effective_project(rec), []).append(rec)
+    flat: list[tuple[str, object]] = []
+    for project, recs in groups.items():
+        flat.append(("h", project))
+        for rec in recs:
+            flat.append(("p", rec))
+    return flat
+
+
+def _switch_pane_label(rec: dict) -> str:
+    status = rec.get("status", "unknown")
+    return _u16_truncate(
+        f"{STATUS_GLYPH.get(status, '💤')} {_pane_line_label(rec)}", 60
+    )
+
+
+def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") -> InlineKeyboardMarkup:
+    if statusf not in SWITCH_FILTERS:
+        statusf = "all"
+    query = query[:24]
+    flat = _switch_flat(statusf, query)
+    page_count = max(1, (len(flat) + SWITCH_PAGE_SIZE - 1) // SWITCH_PAGE_SIZE)
+    page = min(max(page, 0), page_count - 1)
+    visible = flat[page * SWITCH_PAGE_SIZE:(page + 1) * SWITCH_PAGE_SIZE]
+
+    keyboard = []
+    for kind, payload in visible:
+        if kind == "h":
+            keyboard.append([InlineKeyboardButton(
+                f"▸ {payload}", callback_data=_switch_cb(action="noop")
+            )])
+        else:
+            keyboard.append([InlineKeyboardButton(
+                _switch_pane_label(payload),
+                callback_data=pane_callback_data("switch", payload["pane_id"]),
+            )])
+
+    keyboard.append([
+        InlineKeyboardButton(
+            ("● " if statusf == f else "○ ") + SWITCH_FILTER_LABELS[f],
+            callback_data=_switch_cb(action="switch-filter", f=f, q=query),
+        )
+        for f in SWITCH_FILTERS
+    ])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "Previous",
+            callback_data=_switch_cb(action="switch-menu", page=page - 1, f=statusf, q=query),
+        ))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton(
+            "Next",
+            callback_data=_switch_cb(action="switch-menu", page=page + 1, f=statusf, q=query),
+        ))
+    if nav:
+        keyboard.append(nav)
+    if query:
+        keyboard.append([InlineKeyboardButton(
+            f"✖ 清除搜索: {_u16_truncate(query, 40)}",
+            callback_data=_switch_cb(action="switch-filter", f=statusf, q=""),
+        )])
+    return InlineKeyboardMarkup(keyboard)
+
+
+async def send_focus_prompt(message, chat, rec: dict):
+    """Confirm the new focus and (private chats) raise the reply box."""
+    title = agent_identity(rec)
+    text = (
+        f"🎯 <b>{_html_escape(title)}</b>\n"
+        "已聚焦：之后直接输入消息即可，不需要 reply 任何消息。"
+    )
+    kwargs = {"parse_mode": "HTML"}
+    if getattr(chat, "type", None) == "private":
+        kwargs["reply_markup"] = ForceReply(
+            selective=True,
+            input_field_placeholder=_u16_truncate("消息发往 " + title, 63),
+        )
+    return await message.reply_text(text, **kwargs)
+
+
+def receipt_keyboard(pane_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("📖 Read", callback_data=pane_callback_data("read", pane_id)),
+        InlineKeyboardButton(
+            "🔀 切换", callback_data=_switch_cb(action="switch-open")
+        ),
+    ]])
+
+
+def sent_receipt(rec: dict, now: float) -> str:
+    return (
+        f"✅ 已发送 → <b>{_html_escape(agent_identity(rec))}</b> · {_hhmm(now)}"
+    )
+
+
 def prune_pane_state(now: float, live_panes: set[str]):
     """Drop bookkeeping for panes that have been absent past the grace window."""
-    global state_dirty
+    global state_dirty, active_pane
     for pane_id in [pid for pid, ts in pane_seen.items()
                     if pid not in live_panes and now - ts > PANE_STATE_GRACE]:
         pane_messages.pop(pane_id, None)
@@ -1045,13 +1349,17 @@ def prune_pane_state(now: float, live_panes: set[str]):
         done_at.pop(pane_id, None)
         prev_statuses.pop(pane_id, None)
         daily_stats.pop(pane_id, None)
+        if pane_id in recent_panes:
+            recent_panes.remove(pane_id)
+        if active_pane == pane_id:
+            active_pane = None
         state_dirty = True
 
 
 # --- State persistence (survive launchd restarts, never holds content) ------
 
 def load_state():
-    global dashboard_msg_id
+    global dashboard_msg_id, active_pane, recent_panes
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             data = json.load(f)
@@ -1071,6 +1379,12 @@ def load_state():
     for pane_id, status in (data.get("statuses") or {}).items():
         if status in STATUS_ORDER:
             prev_statuses[str(pane_id)] = status
+    focus = data.get("active_pane")
+    if isinstance(focus, str) and focus:
+        active_pane = focus
+    recents = data.get("recent") or []
+    if isinstance(recents, list):
+        recent_panes = [pid for pid in recents if isinstance(pid, str)][:RECENT_MAX]
 
 
 def save_state():
@@ -1085,6 +1399,8 @@ def save_state():
                 if time.time() - ts <= DASHBOARD_DONE_TTL
             },
             "statuses": {pid: st for pid, st in prev_statuses.items() if pid in live},
+            "active_pane": active_pane,
+            "recent": recent_panes[:RECENT_MAX],
         }
         tmp = STATE_FILE + ".tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -1105,8 +1421,10 @@ DASHBOARD_HELP = (
     "The live dashboard above refreshes on its own — long-press it and Pin so "
     "it stays at the top of the chat.\n\n"
     "Blocked sessions post one alert that turns into a ✅ one-liner when they "
-    "finish; tap a row or use /read for the full transcript, or reply to any "
-    "session message to send a follow-up."
+    "finish; tap a row or use /read for the full transcript.\n\n"
+    "The bar at the bottom focuses one session: /switch (or 📋 切换 session) "
+    "picks it, and afterwards every plain message goes straight there — no "
+    "reply needed. Replying to any session card still targets that card once."
 )
 
 
@@ -1132,6 +1450,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     if await _show_dashboard(update, ctx):
+        bot = getattr(ctx, "bot", None)
+        if bot is not None:
+            await refresh_bar(bot, force=True)
         await update.message.reply_text(DASHBOARD_HELP)
 
 
@@ -1141,6 +1462,52 @@ async def cmd_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     if await _show_dashboard(update, ctx):
         await update.message.reply_text("Dashboard refreshed (pin it to keep it on top).")
+
+
+async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /switch [query] — project-grouped focus selector."""
+    if not authorized(update):
+        return
+    query = " ".join(ctx.args or []).strip()
+    if not relay_connected and not human_agents():
+        await update.message.reply_text("Relay disconnected. Use /switch after it reconnects.")
+        return
+    flat = _switch_flat("all", query)
+    if not flat:
+        await update.message.reply_text(
+            "没有匹配的人类 session（thread worker 已隐藏）。"
+            if query else "没有人类 session 在线（thread worker 已隐藏）。"
+        )
+        return
+    await update.message.reply_text(
+        ("选择消息发送目标" + (f"（搜索: {_u16_truncate(query, 40)}）" if query else "")
+         + "，可按状态过滤："),
+        reply_markup=build_switch_keyboard(query=query),
+    )
+
+
+async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /find <keyword> — /switch with a text filter."""
+    if not authorized(update):
+        return
+    if not ctx.args:
+        await update.message.reply_text("用法: /find <project/session/pane 关键词>")
+        return
+    await cmd_switch(update, ctx)
+
+
+async def cmd_unfocus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /unfocus — clear the sticky target so plain text goes nowhere."""
+    if not authorized(update):
+        return
+    if active_pane is None:
+        await update.message.reply_text("当前没有聚焦的 session。")
+        return
+    unfocus_pane()
+    bot = getattr(ctx, "bot", None)
+    if bot is not None:
+        await refresh_bar(bot, force=True)
+    await update.message.reply_text("已取消聚焦，之后的消息不会发送，直到你重新 /switch。")
 
 
 async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1184,9 +1551,15 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     i = len([a for a in agents if a.get("status") in ("idle", "unknown")])
 
     status = "Connected" if relay_connected else "Disconnected"
+    focus = "none"
+    if active_pane and (rec := find_agent(active_pane)) is not None:
+        focus = agent_identity(rec)
+    elif active_pane:
+        focus = f"{active_pane} (offline)"
     text = (
         f"Relay: {RELAY_WS_SAFE}\n"
         f"Status: {status}\n"
+        f"Focus: {focus}\n"
         f"Agents: {len(agents)} ({b} blocked, {w} working, {d} done, {i} idle)"
     )
     await update.message.reply_text(text)
@@ -1384,6 +1757,9 @@ async def deliver_choice(query, pane_id: str, label: str, deliver) -> bool:
         return False
     finally:
         approval_in_flight.discard(pane_id)
+    # The human is now interacting with this pane: make plain-text follow-ups
+    # land here without a Telegram reply.
+    focus_pane(pane_id)
     await query.message.reply_text(f"Sent: {label}")
     return True
 
@@ -1411,6 +1787,50 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(
             reply_markup=build_agent_keyboard(menu, page=data.get("page", 0))
         )
+        return
+
+    if action == "noop":
+        # Group-header buttons in the /switch selector do nothing.
+        return
+
+    if action in ("switch-menu", "switch-filter"):
+        statusf = data.get("f", "all")
+        query_text = data.get("q", "") or ""
+        page = data.get("page", 0) if action == "switch-menu" else 0
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=build_switch_keyboard(page=page, statusf=statusf, query=query_text)
+            )
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+        return
+
+    if action == "switch-open":
+        await query.message.reply_text(
+            "选择消息发送目标：", reply_markup=build_switch_keyboard()
+        )
+        return
+
+    if action == "switch":
+        pane_id = data.get("pane_id")
+        selected = next(
+            (agent for agent in human_agents() if agent.get("pane_id") == pane_id),
+            None,
+        )
+        if selected is None:
+            await query.message.reply_text(
+                "That session is no longer available. Open the selector again.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "📋 切换 session", callback_data=_switch_cb(action="switch-open")
+                )]]),
+            )
+            return
+        focus_pane(selected["pane_id"])
+        bot = getattr(ctx, "bot", None)
+        if bot is not None:
+            await refresh_bar(bot, force=True)
+        await send_focus_prompt(query.message, update.effective_chat, selected)
         return
 
     selected_agent = None
@@ -1535,31 +1955,129 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # --- Free text reply ---
 
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Send a Telegram reply to its associated agent pane."""
-    if not authorized(update) or not update.message.reply_to_message:
+    """Route free text: bottom-bar taps, a one-off reply target, or the focus pane."""
+    if not authorized(update):
         return
-    pane_id = pending_pane(update.effective_chat.id, update.message.reply_to_message.message_id)
-    if not pane_id:
+    message = update.message
+    if not message.text:
         return
+    chat = update.effective_chat
+    is_private = getattr(chat, "type", None) == "private"
+
+    # Bottom-bar keys arrive as their button labels; act on them and never let
+    # the label text reach a pane.
+    if is_private:
+        kind, bar_pane = bar_label_pane(message.text)
+        if kind:
+            await handle_bar_tap(update, ctx, kind, bar_pane)
+            return
+
+    target_id: str | None = None
+    if message.reply_to_message:
+        mapped = pending_pane(chat.id, message.reply_to_message.message_id)
+        if mapped:
+            target_id = mapped
+            # Replying to a specific card both sends once and re-focuses it.
+            focus_pane(mapped)
+
+    if target_id is None and is_private and active_pane:
+        target_id = active_pane
+
+    if target_id is None:
+        # Private chats must not swallow text silently: open the selector.
+        # Group chats keep the legacy reply-only contract.
+        if is_private:
+            if not relay_connected:
+                await message.reply_text(
+                    "Relay disconnected. Use /start after it reconnects."
+                )
+            elif not human_agents():
+                await message.reply_text(
+                    "还没有聚焦的 session（thread worker 已隐藏）。"
+                )
+            else:
+                await message.reply_text(
+                    "先选择消息要发往的 session：",
+                    reply_markup=build_switch_keyboard(),
+                )
+        return
+
     if not relay_connected:
-        await update.message.reply_text("Relay disconnected. Use /start after it reconnects.")
+        await message.reply_text("Relay disconnected. Use /start after it reconnects.")
         return
-    if find_agent(pane_id) is None:
-        await update.message.reply_text(
-            "That agent is no longer available. Refresh the list and choose another agent.",
-            reply_markup=refresh_keyboard("select_reply"),
+    rec = find_agent(target_id)
+    if rec is None:
+        if active_pane == target_id:
+            unfocus_pane()
+        bot = getattr(ctx, "bot", None)
+        if bot is not None and is_private:
+            await refresh_bar(bot, force=True)
+        await message.reply_text(
+            "That agent is no longer available. Choose another session:",
+            reply_markup=build_switch_keyboard() if is_private else None,
         )
         return
 
+    # No force-refresh here: focus changes (reply redirect / selector tap)
+    # already mark the bar dirty and the loop swaps it within ~1s, so typing a
+    # message must not spawn a send+deleted placeholder of its own.
     try:
-        prompt_id = blocked_prompt_ids.get(pane_id)
+        prompt_id = blocked_prompt_ids.get(target_id)
         if prompt_id:
-            await send_to_relay(pane_id, update.message.text, prompt_id=prompt_id)
+            await send_to_relay(target_id, message.text, prompt_id=prompt_id)
         else:
-            await send_text_to_relay(pane_id, update.message.text)
-        await update.message.reply_text("Sent")
+            await send_text_to_relay(target_id, message.text)
+        if is_private:
+            await message.reply_text(
+                sent_receipt(rec, time.time()),
+                parse_mode="HTML",
+                reply_markup=receipt_keyboard(target_id),
+            )
+        else:
+            await message.reply_text("Sent")
     except Exception as e:
-        await update.message.reply_text(f"Failed: {scrub(e)}")
+        await message.reply_text(f"Failed: {scrub(e)}")
+
+
+async def handle_bar_tap(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
+                         kind: str, pane_id: str | None):
+    """Dispatch a tapped persistent-bar button."""
+    message = update.message
+    if kind == "switch":
+        await cmd_switch(update, ctx)
+        return
+    if kind == "dashboard":
+        await cmd_dashboard(update, ctx)
+        return
+    if kind == "unfocus":
+        await cmd_unfocus(update, ctx)
+        return
+    if kind == "recent" and pane_id:
+        rec = find_agent(pane_id)
+        if rec is None:
+            await message.reply_text(
+                "That session is no longer available.",
+                reply_markup=build_switch_keyboard(),
+            )
+            return
+        focus_pane(pane_id)
+        bot = getattr(ctx, "bot", None)
+        if bot is not None:
+            await refresh_bar(bot, force=True)
+        await send_focus_prompt(message, update.effective_chat, rec)
+        return
+    if kind == "active":
+        rec = find_agent(pane_id) if pane_id else None
+        if rec is None:
+            await message.reply_text("聚焦的 session 已离线，重新选择：",
+                                     reply_markup=build_switch_keyboard())
+            unfocus_pane()
+            return
+        await message.reply_text(
+            f"🎯 当前消息发往 <b>{_html_escape(agent_identity(rec))}</b>\n"
+            "直接输入即可；点 ✖ 取消聚焦 或用 /switch 切换。",
+            parse_mode="HTML",
+        )
 
 
 # --- Blocked notification ---
@@ -1908,6 +2426,7 @@ async def relay_listener(app: Application):
                                 live_panes.add(pid)
                         prune_pane_state(now, live_panes)
                         mark_dashboard_dirty()
+                        mark_bar_dirty()
 
                     elif msg.get("type") == "agent_update":
                         updated_agent = msg.get("agent") or {}
@@ -1916,6 +2435,7 @@ async def relay_listener(app: Application):
                             agents = apply_agent_message(agents, msg)
                             pane_seen[updated_agent["pane_id"]] = time.time()
                             mark_dashboard_dirty()
+                            mark_bar_dirty()
 
                     elif msg.get("type") == "blocked":
                         await notify_blocked_safely(app, msg)
@@ -1938,6 +2458,9 @@ def main():
 
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
     app.add_handler(CommandHandler("dashboard", cmd_dashboard, filters=auth_filter))
+    app.add_handler(CommandHandler("switch", cmd_switch, filters=auth_filter))
+    app.add_handler(CommandHandler("find", cmd_find, filters=auth_filter))
+    app.add_handler(CommandHandler("unfocus", cmd_unfocus, filters=auth_filter))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))
     app.add_handler(CommandHandler("status", cmd_status, filters=auth_filter))
     app.add_handler(CommandHandler("read", cmd_read, filters=auth_filter))
