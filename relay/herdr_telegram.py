@@ -89,6 +89,10 @@ SWITCH_PAGE_SIZE = 10             # rows per /switch page, group headers include
 RECENT_MAX = 8                    # recent panes persisted in the state file
 RECENT_BAR_SLOTS = 3              # recent panes shown on the persistent bar
 BAR_MIN_INTERVAL = 1.0            # fastest cadence of silent bar refreshes
+# Telegram strips a bare U+200B and rejects the message ("Text must be
+# non-empty"); U+2800 braille blank survives the trim while rendering empty.
+# The placeholder is deleted immediately anyway.
+BAR_PLACEHOLDER = "\u2800"
 BAR_SWITCH_LABEL = "📋 切换 session"
 BAR_DASHBOARD_LABEL = "📊 Dashboard"
 BAR_UNFOCUS_LABEL = "✖ 取消聚焦"
@@ -1061,9 +1065,9 @@ async def dashboard_loop(app: Application):
 #
 # A ReplyKeyboardMarkup lives above the input box independently of any message,
 # so it is the only Telegram primitive that can hold always-available session
-# controls. It is swapped silently: a zero-width-space message carrying the new
-# markup is sent and deleted at once (the keyboard itself survives the delete),
-# signature-gated so snapshots cannot spam the chat. Tapping a key sends its
+# controls. It is swapped silently: an invisible-placeholder message carrying
+# the new markup is sent and deleted at once (the keyboard itself survives the
+# delete), signature-gated so snapshots cannot spam the chat. Tapping a key sends its
 # label as an ordinary text message; those labels are intercepted in
 # handle_text and never forwarded to a pane.
 
@@ -1158,7 +1162,7 @@ async def refresh_bar(bot, force: bool = False):
         return
     chat_id = int(CHAT_ID)
     try:
-        sent = await bot.send_message(chat_id, "\u200b", reply_markup=markup)
+        sent = await bot.send_message(chat_id, BAR_PLACEHOLDER, reply_markup=markup)
         try:
             await bot.delete_message(chat_id=chat_id, message_id=sent.message_id)
         except Exception:

@@ -199,7 +199,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         await tg.cmd_start(disconnected, SimpleNamespace(args=[], bot=bot))
         # No dashboard while relay is down; only the (immediately deleted)
         # persistent-bar placeholder goes out, so nothing visible remains.
-        visible = [s for s in bot.sent if s[1] != "\u200b"]
+        visible = [s for s in bot.sent if s[1] != tg.BAR_PLACEHOLDER]
         self.assertEqual(visible, [])
         self.assertTrue(bot.deleted)
         self.assertIn("dashboard", disconnected.message.replies[0][0].lower())
@@ -208,7 +208,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         empty = make_update()
         await tg.cmd_start(empty, SimpleNamespace(args=[], bot=bot))
         # Connected with no panes: the dashboard gets posted to the chat directly.
-        posted = [s for s in bot.sent if s[1] != "\u200b"]
+        posted = [s for s in bot.sent if s[1] != tg.BAR_PLACEHOLDER]
         self.assertEqual(len(posted), 1)
         self.assertIn("no human sessions", posted[0][1].lower())
 
@@ -221,7 +221,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         await tg.cmd_start(update, SimpleNamespace(args=[], bot=bot))
 
         # Dashboard collapses 16 idle panes to a count and exposes the picker.
-        posted = [s for s in bot.sent if s[1] != "\u200b"]
+        posted = [s for s in bot.sent if s[1] != tg.BAR_PLACEHOLDER]
         _chat, text, kwargs, _msg = posted[0]
         self.assertIn("16 panes", text)
         self.assertIn("💤 16 idle", text)
@@ -1377,7 +1377,7 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         bot = FakeBot()
         await tg.refresh_bar(bot)
         self.assertEqual(len(bot.sent), 1)
-        self.assertEqual(bot.sent[0][1], "\u200b")
+        self.assertEqual(bot.sent[0][1], tg.BAR_PLACEHOLDER)
         self.assertEqual(bot.deleted, [(42, bot.sent[0][3].message_id)])
         # Signature-gated: a second refresh does nothing.
         await tg.refresh_bar(bot)
