@@ -109,9 +109,9 @@ QUESTION_PROBE_SKIP_STATUSES = frozenset({"working", "blocked"})
 AUTH_TOKEN = os.environ.get("HERDR_RELAY_TOKEN", "")  # Optional: shared secret for relay auth
 TRUSTED_ORIGINS = [o.strip().lower() for o in os.environ.get("HERDR_TRUSTED_ORIGINS", "").split(",") if o.strip()]
 
-# Session selection per source. Key is None for local, else the "user@host"
-# string from HERDR_REMOTES. Value is a session name, or None to follow
-# herdr's own default session.
+# Session selection per source. Key is None for local, else the SSH target
+# string -- from HERDR_REMOTES or machine discovery (REMOTES is the merged
+# list). Value is a session name, or None to follow herdr's own default.
 DEFAULT_LOCAL_SESSION = os.environ.get("HERDR_SESSION") or None
 ACTIVE_SESSIONS = {}
 
@@ -178,8 +178,31 @@ SEEN_ON = frozenset({
 if RELAY_HOST not in {"127.0.0.1", "localhost", "::1"} and not AUTH_TOKEN:
     raise SystemExit("HERDR_RELAY_TOKEN is required when HERDR_RELAY_HOST binds beyond loopback")
 
-# Remote hosts: comma-separated SSH targets
-REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if r.strip()]
+# Remote hosts polled over SSH. Two sources, merged:
+#
+# 1. HERDR_REMOTES -- comma-separated SSH targets, explicit and always honoured. Entries here are
+#    ADDED to anything discovery finds; they win ordering (they come first) and are never dropped
+#    by a failed discovery.
+# 2. `herdr machine list` -- the saved-machines feature in herdr itself. Every machine whose
+#    stored status is `enabled` is an SSH target herdr already knows how to reach, so a machine
+#    configured at the desk shows up in the bot without a second, machine-local config.env.
+#    Disable with HERDR_NO_MACHINE_DISCOVERY=1 (the env list then stands alone). The read is
+#    LOCAL -- it only lists saved machines -- costs ~5ms, and is cached on a slow cadence
+#    (MACHINE_DISCOVERY_TTL), never run on a 2s poll tick. A failed invocation logs a warning
+#    once and keeps the last good set (fail-sticky): discovery going down must not zero out the
+#    remotes. Machines that would SSH back into ourselves are skipped.
+ENV_REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if r.strip()]
+MACHINE_DISCOVERY = os.environ.get("HERDR_NO_MACHINE_DISCOVERY", "").strip().lower() not in {
+    "1", "true", "yes", "on",
+}
+MACHINE_DISCOVERY_TTL = 45.0
+# The effective target list, mutated in place by refresh_remote_machines() so existing references
+# keep tracking it: tests and a few call sites hold `REMOTES` directly, mirroring the env list it
+# used to be.
+REMOTES = list(ENV_REMOTES)
+_discovered_remotes = []
+_machines_last_refresh = 0.0
+_machines_refresh_failed = False
 
 TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edit)"]
 SUBAGENT_OPTIONS = ["approve all pending", "configure individually", "exit (cancel subagents)"]
@@ -820,31 +843,125 @@ _load_active_sessions()
 _load_activity()
 
 
+# OpenSSH appends "." + 16 random chars (measured on OpenSSH 10.3: ".FyzPUeZb4jvUDNoi") to the
+# control socket when it creates the master, and checks the WHOLE name against the platform's
+# sun_path limit (104 bytes on macOS, 108 on Linux). And %C is not 32 chars: it expands to a
+# 40-char (SHA-1) hex hash. Measured failure on this Mac, with a 49-char log dir:
+#
+#   /Users/bytedance/Library/Logs/herdr-remote/ssh-aa67c3...033cc3.FyzPUeZb4jvUDNoi
+#
+# 49 + 4 + 40 + 1 + 16 = 110 > 104, so ssh failed "too long for Unix domain socket",
+# ControlMaster never established -- and every remote poll then died silently, because the old
+# 90-char check had measured the LITERAL template (57 chars with %C still two characters).
+_SSH_CONTROL_HASH_LEN = 40
+_SSH_CONTROL_SUFFICE_LEN = 17          # "." + the 16-char tag ssh mktemp's onto the master socket
+_SSH_SUN_PATH_LIMIT = 104 if sys.platform == "darwin" else 108
+# Keep one byte of margin even under the limit.
+_SSH_CONTROL_PATH_BUDGET = _SSH_SUN_PATH_LIMIT - _SSH_CONTROL_SUFFICE_LEN - 1
+
+
+def _control_path_fits(control_path):
+    """Whether the socket ssh will actually create -- %C expanded, suffix included -- fits."""
+    expanded = control_path.replace("%C", "a" * _SSH_CONTROL_HASH_LEN)
+    # %h/%n can be a long hostname; size them generously too, for callers using their own
+    # template via HERDR_SSH_CONTROL_PATH.
+    expanded = expanded.replace("%h", "h" * 64).replace("%n", "n" * 64).replace("%r", "r" * 32)
+    return len(expanded) <= _SSH_CONTROL_PATH_BUDGET
+
+
+def _default_control_path():
+    """A multiplexing socket short enough to work out of the box.
+
+    The log directory is the wrong home for this: ~/Library/Logs plus a long username produces a
+    43-char directory before the socket name. ~/.ssh is where ssh keeps its own control sockets,
+    it exists on any host with SSH configured, and its path is short. The per-user state dir is
+    the fallback when neither is writable.
+    """
+    candidates = [os.path.expanduser("~/.ssh/herdr-remote-%C")]
+    state_dir = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    candidates.append(os.path.join(state_dir, "herdr-remote", "ssh-%C"))
+    candidates.append(os.path.join(LOG_DIR, "ssh-%C"))
+    for candidate in candidates:
+        parent = os.path.dirname(candidate)
+        if os.path.isdir(parent) and os.access(parent, os.W_OK) and _control_path_fits(candidate):
+            return candidate
+    return candidates[0]
+
+
 def _ssh_base_args():
     """SSH options every remote invocation shares, with connection reuse where it is available.
 
     The poll loop dials every configured host once per POLL_INTERVAL, and each dial used to be a
     full TCP + auth handshake -- 30 handshakes a minute per host at a 2s interval. ControlMaster
-    keeps one connection alive across ticks instead. `%C` hashes user/host/port into a
-    fixed-width name so the control socket path stays inside the ~104-byte AF_UNIX limit; if the
-    path would still be too long, or we are on Windows (whose OpenSSH has no multiplexing), we
-    simply run without it rather than break every remote read.
+    keeps one connection alive across ticks instead. If the socket path would still be too long,
+    or we are on Windows (whose OpenSSH has no multiplexing), we simply run without it rather
+    than break every remote read.
     """
     base = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
     if sys.platform == "win32":
-        return base
-    control_path = os.environ.get("HERDR_SSH_CONTROL_PATH") or os.path.join(LOG_DIR, "ssh-%C")
-    if len(control_path) > 90:
-        log.warning("SSH control path too long (%d chars); running without multiplexing", len(control_path))
-        return base
+        return base, None
+    control_path = os.environ.get("HERDR_SSH_CONTROL_PATH") or _default_control_path()
+    if not _control_path_fits(control_path):
+        log.warning(
+            "SSH control path too long (%d chars once %%C expands and ssh appends its suffix; "
+            "limit %d); running without multiplexing. Set HERDR_SSH_CONTROL_PATH to a shorter "
+            "template if you want it back.",
+            len(control_path.replace("%C", "a" * _SSH_CONTROL_HASH_LEN)),
+            _SSH_CONTROL_PATH_BUDGET,
+        )
+        return base, None
     return base + [
         "-o", "ControlMaster=auto",
         "-o", f"ControlPath={control_path}",
         "-o", "ControlPersist=60s",
-    ]
+    ], control_path
 
 
-SSH_BASE_ARGS = _ssh_base_args()
+SSH_BASE_ARGS, SSH_CONTROL_PATH = _ssh_base_args()
+# The same options without the three multiplexing ones, for hosts whose master failed. Building
+# it by filtering the flat argv would leave the "-o" arguments dangling.
+SSH_PLAIN_BASE_ARGS = ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
+# Hosts whose ControlMaster could not be established (path too long, a stale socket, a permissions
+# problem...). Once multiplexing has demonstrably failed for a host it is dropped to plain ssh for
+# the rest of the process: the alternative is every remote command failing the same way forever.
+# Per host, behind the same guard that serialises that host's ssh calls.
+_ssh_master_disabled = set()
+# The first failure is the one worth a log line; the next thousand would only hide it.
+_ssh_master_warned = set()
+# Distinguishes "the multiplexed connection failed" from every other ssh failure by ssh's own
+# wording -- this is the message OpenSSH prints when it cannot bind the master socket.
+_SSH_MASTER_ERROR_RE = re.compile(r"unix_listener: .*(too long for Unix domain socket|failed)")
+
+
+def _ssh_args(remote):
+    """SSH option list for one host, degrading to a plain connection if multiplexing broke for it.
+
+    ControlMaster=auto means the first call creates the master; if THAT fails -- the control
+    socket cannot be created, say -- every later call would fail identically. So on the first
+    multiplexing-shaped failure for a host we warn once and drop the multiplexing options for
+    that host; a direct ssh still answers, which is the whole point.
+    """
+    if not SSH_CONTROL_PATH or remote in _ssh_master_disabled:
+        return SSH_PLAIN_BASE_ARGS
+    return SSH_BASE_ARGS
+
+
+def _ssh_note_result(remote, returncode, stderr):
+    """Inspect one finished ssh call and retire multiplexing for a host whose master failed."""
+    if not SSH_CONTROL_PATH or remote in _ssh_master_disabled:
+        return
+    if returncode == 0 or not _SSH_MASTER_ERROR_RE.search(stderr or ""):
+        return
+    with _remote_locks_guard:
+        first = remote not in _ssh_master_warned
+        _ssh_master_warned.add(remote)
+        _ssh_master_disabled.add(remote)
+    if first:
+        log.warning(
+            "SSH ControlMaster for %s could not be established (%s); falling back to "
+            "connections without multiplexing for this host.",
+            remote, (stderr or "").strip().splitlines()[0][:200] if stderr else "",
+        )
 
 
 def _remote_lock(remote):
@@ -870,13 +987,16 @@ def _invoke_herdr(*args, remote=None):
     """
     session = active_session_for(remote)
     if remote:
-        cmd = ["ssh", *SSH_BASE_ARGS, remote]
+        cmd = ["ssh", *_ssh_args(remote), remote]
         if session:
             # An env= would not survive ssh; the remote shell applies this.
             cmd.append(f"HERDR_SESSION={shlex.quote(session)}")
         cmd += [REMOTE_HERDR, *(shlex.quote(str(arg)) for arg in args)]
         with _remote_lock(remote):
-            return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+            result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=15)
+        _ssh_note_result(remote, result.returncode, getattr(result, "stderr", ""))
+        return result
 
     cmd = [HERDR, *args]
     return subprocess.run(
@@ -891,12 +1011,16 @@ def transcript_ssh(remote, script, ssh_args=()):
     Bytes, not text: the reply is a framed header plus a raw tail of the transcript, and the cut
     has to be made on a byte boundary before anything tries to decode it.
     """
-    cmd = ["ssh", *ssh_args, remote, "sh -c " + shlex.quote(script)]
+    # No explicit args -- the history handler's normal path -- means "whatever this host's
+    # multiplexing state currently is", so a master that failed is retired here too.
+    args = list(ssh_args) if ssh_args else _ssh_args(remote)
+    cmd = ["ssh", *args, remote, "sh -c " + shlex.quote(script)]
     with _remote_lock(remote):
         proc = subprocess.run(cmd, capture_output=True, timeout=transcript.REMOTE_TIMEOUT)
     if proc.returncode != 0:
-        log.warning("transcript ssh on %s exited %s: %s", remote, proc.returncode,
-                    proc.stderr.decode("utf-8", "replace").strip()[:200])
+        stderr = proc.stderr.decode("utf-8", "replace").strip()
+        _ssh_note_result(remote, proc.returncode, stderr)
+        log.warning("transcript ssh on %s exited %s: %s", remote, proc.returncode, stderr[:200])
     return proc.returncode, proc.stdout
 
 
@@ -1238,6 +1362,143 @@ def get_all_panes():
         agents.extend(more_agents)
         shells.extend(more_shells)
     return agents, shells
+
+
+def parse_machine_list(raw):
+    """Targets from `herdr machine list`, via --json when the CLI offers it (it does) and the
+    whitespace table as a fallback for older herdr. Only enabled machines come back.
+
+    Table shape, header included in some versions:
+        <id>  <label>  <target>  <session>  enabled
+
+    The TARGET is the SSH target -- `herdr machine add <SSH_TARGET>` stores exactly that -- while
+    label is display-only and may be empty. Rows we cannot make sense of are skipped; a stray
+    stderr line must not become an SSH target.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        data = None
+    if isinstance(data, list):
+        targets = []
+        for entry in data:
+            if not isinstance(entry, dict) or entry.get("enabled") is not True:
+                continue
+            target = entry.get("target")
+            if isinstance(target, str) and target.strip():
+                targets.append(target.strip())
+        return targets
+    # Table fallback: whitespace columns, skip a possible header and malformed rows.
+    targets = []
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        status = parts[-1].lower()
+        if status not in {"enabled", "disabled"}:
+            continue            # header or not a machine row at all
+        if status != "enabled":
+            continue
+        target = parts[2].strip()
+        if target:
+            targets.append(target)
+    return targets
+
+
+def _self_ssh_targets():
+    """SSH target spellings that would connect back to THIS machine.
+
+    Discovery lists machines saved by the local herdr; one of them can be the machine itself
+    (a laptop that is also a remote for other hosts). SSH-polling ourselves over the network
+    would double-list every local pane and fight the local herdr over its own socket.
+    """
+    names = {"localhost", "127.0.0.1", "::1"}
+    try:
+        hostname = socket.gethostname()
+        if hostname:
+            names.add(hostname)
+            names.add(hostname.split(".")[0])
+    except OSError:
+        pass
+    return names
+
+
+def discover_remote_machines():
+    """Enabled, non-self SSH targets from the local herdr's saved machines.
+
+    Returns a list (possibly empty) on a successful read, or None when the CLI could not be
+    read -- the caller treats None as "keep the last good set" and [] as a real, successful
+    "no machines". Prefers --json (stable output) and falls back to the plain table for older
+    herdr. Raises nothing: a discovery bug must not take down the poll loop.
+    """
+    raw = None
+    try:
+        result = run_herdr_result("machine", "list", "--json")
+        if result.returncode == 0:
+            raw = result.stdout
+        else:
+            # --json unknown to this herdr (clap exits 2 on an unknown flag): try the table.
+            result = run_herdr_result("machine", "list")
+            if result.returncode == 0:
+                raw = result.stdout
+    except Exception:
+        log.exception("machine discovery failed")
+        return None
+    if raw is None:
+        return None
+    targets = parse_machine_list(raw)
+    self_names = _self_ssh_targets()
+    filtered = []
+    for target in targets:
+        bare = target.split("@")[-1]
+        if bare in self_names or target in self_names:
+            log.info("skipping discovered machine %s: it is this machine", target)
+            continue
+        filtered.append(target)
+    return filtered
+
+
+def refresh_remote_machines(force=False):
+    """Re-discover saved machines on a slow cadence and merge them into REMOTES.
+
+    Fail-sticky by design: a failed `herdr machine list` keeps the last good discovered set
+    rather than zeroing every remote out for a poll. An empty SUCCESSFUL read is different: the
+    operator disabled or removed their machines, so the discovered entries really do go. Env
+    entries stay first and are never removed; a duplicate target is listed once. BLOCKING -- the
+    CLI call this makes is local and cached on MACHINE_DISCOVERY_TTL; call from a worker thread.
+    """
+    global _machines_last_refresh, _machines_refresh_failed, _discovered_remotes
+    if not MACHINE_DISCOVERY:
+        return list(REMOTES)
+    now = time.monotonic()
+    if not force and _machines_last_refresh and now - _machines_last_refresh < MACHINE_DISCOVERY_TTL:
+        return list(REMOTES)
+    _machines_last_refresh = now
+    discovered = discover_remote_machines()
+    if discovered is None:
+        if not _machines_refresh_failed:
+            _machines_refresh_failed = True
+            log.warning(
+                "could not read 'herdr machine list'; keeping %d previously discovered "
+                "remote(s) and retrying", len(_discovered_remotes))
+        discovered = _discovered_remotes
+    else:
+        if _machines_refresh_failed:
+            log.info("machine discovery recovered; %d enabled remote(s) found", len(discovered))
+        _machines_refresh_failed = False
+        _discovered_remotes = discovered
+    merged = list(ENV_REMOTES)
+    seen = set(merged)
+    for target in discovered:
+        if target not in seen:
+            merged.append(target)
+            seen.add(target)
+    # Mutate in place: callers and tests hold a direct reference to REMOTES.
+    REMOTES[:] = merged
+    return merged
 
 
 def get_all_agents():
@@ -2656,6 +2917,10 @@ def probe_idle_questions(agents):
 
 async def _poll_once():
         gen = POLL_GENERATION
+        # Pick up machines enabled/disabled at the desk, on discovery's own slow cadence. In-cache
+        # this is two monotonic comparisons; the one local subprocess it makes every
+        # MACHINE_DISCOVERY_TTL stays off the loop thread.
+        await asyncio.to_thread(refresh_remote_machines)
         agents, shells = await asyncio.to_thread(get_all_panes)
         # Before update_pane_maps and before the snapshot, so the activity ledger, the clients and
         # the blocked branch below all see one status for the pane rather than three.
@@ -3366,7 +3631,9 @@ async def handle_client(ws):
                     before=before or None,
                     include_tools=bool(msg.get("include_tools")),
                     agent=pane.get("agent", ""),
-                    ssh_args=SSH_BASE_ARGS,
+                    # Empty, not SSH_BASE_ARGS: transcript_ssh resolves the per-host args itself,
+                    # so a host whose ControlMaster failed stays on plain ssh for history reads.
+                    ssh_args=(),
                     remote_runner=transcript_ssh,
                     log=log,
                 )
@@ -3709,6 +3976,11 @@ async def main():
         # fine. Keep pinging (it holds the proxy path open) but give the pong room.
         server = await serve(handle_client, RELAY_HOST, WS_PORT, process_request=process_request,
                              ping_interval=20, ping_timeout=90)
+        # One uncached read before announcing what we poll, so the line shows the effective
+        # merged list -- env targets plus the machines herdr already has saved. A failure here is
+        # ordinary (no saved machines, an older herdr without the command): the poll retries on
+        # its slow cadence.
+        await asyncio.to_thread(refresh_remote_machines, True)
         hosts = ["local"] + REMOTES
         log.info("herdr-remote relay on %s:%d (WebSocket + HTTP POST)", RELAY_HOST, WS_PORT)
         if VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY and VAPID_SUBJECT_IS_DEFAULT:

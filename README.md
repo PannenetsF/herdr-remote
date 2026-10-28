@@ -63,9 +63,11 @@ herdr plugin list
 ```
 
 The launcher starts a local-only relay on `127.0.0.1:8375` by default. Set
-`HERDR_RELAY_TOKEN` before enabling a tunnel or binding beyond loopback. Use
-`HERDR_REMOTES` for a comma-separated list of SSH targets and `HERDR_BIN` only
-when `herdr` is not available on `PATH`.
+`HERDR_RELAY_TOKEN` before enabling a tunnel or binding beyond loopback. Remote
+hosts come from two places: the enabled machines the local `herdr machine list`
+knows about (auto-discovered, refreshed every 45s), plus any extra SSH targets
+in the comma-separated `HERDR_REMOTES`. Set `HERDR_NO_MACHINE_DISCOVERY=1` to
+poll only the env list. Use `HERDR_BIN` only when `herdr` is not on `PATH`.
 
 For the desktop client -- a tray icon plus a capsule at the top of the screen, with
 toast notifications you can approve or reply to inline -- build
