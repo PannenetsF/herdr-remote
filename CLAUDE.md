@@ -93,8 +93,9 @@ cd herdi-win && ./build.ps1
 |----------|---------|
 | `HERDR_RELAY_PORT` | Relay WebSocket port (default: 8375) |
 | `HERDR_RELAY_TOKEN` | Optional shared secret for auth |
-| `HERDR_REMOTES` | Comma-separated SSH targets to poll |
-| `HERDR_SSH_CONTROL_PATH` | Override the SSH multiplexing control socket (default `<log dir>/ssh-%C`; skipped on Windows, or when the path would exceed the AF_UNIX limit) |
+| `HERDR_REMOTES` | Comma-separated SSH targets to poll, *added* to the machines `herdr machine list` discovers (enabled ones); refresh every 45s, fail-sticky |
+| `HERDR_NO_MACHINE_DISCOVERY` | Set to `1` to poll only `HERDR_REMOTES` and ignore saved machines |
+| `HERDR_SSH_CONTROL_PATH` | Override the SSH multiplexing control socket (default `~/.ssh/herdr-remote-%C`; measured against the expanded socket — `%C` is 40 chars plus ssh's 17-char suffix — and skipped on Windows, or when it would exceed the AF_UNIX limit) |
 | `HERDR_BIN` | Path to herdr binary (default: `/opt/homebrew/bin/herdr`) |
 | `HERDR_RELAY` | Relay URL used by clients (default: `ws://127.0.0.1:8375`) |
 | `HERDR_SESSION` | Boot-time default herdr session; a client can override it per source at runtime via `session_switch` |

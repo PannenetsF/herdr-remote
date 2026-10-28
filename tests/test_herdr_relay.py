@@ -72,7 +72,7 @@ def _http_stubs():
 
 @contextmanager
 def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_origins=None,
-                 shell_panes=None):
+                 shell_panes=None, ssh_control_path=None):
     module_name = f"herdr_relay_test_{uuid.uuid4().hex}"
     logger = logging.getLogger("herdr-relay")
     original_handlers = tuple(logger.handlers)
@@ -86,6 +86,16 @@ def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_o
     original_websockets_level = websockets_logger.level
 
     with tempfile.TemporaryDirectory() as log_dir:
+        # The temp log dir on macOS (/var/folders/...) expands to a ~97-char socket path, which
+        # under the suffix-aware budget correctly disables multiplexing -- so tests that exercise
+        # remote calls pin a short socket instead. Pass ssh_control_path=False to test the real
+        # default resolution, or a string to set HERDR_SSH_CONTROL_PATH.
+        if ssh_control_path is None:
+            # Short enough that the suffix-aware budget keeps multiplexing on. $TMPDIR on macOS is
+            # a 48-char /var/folders path whose expanded socket would correctly fail it; no ssh
+            # ever actually runs in these tests (subprocess.run is stubbed), so the socket is
+            # only ever a string.
+            ssh_control_path = "/tmp/herdr-remote-test-%C"
         environment = {"HERDR_LOG_DIR": log_dir}
         if herdr_bin is not None:
             environment["HERDR_BIN"] = herdr_bin
@@ -97,6 +107,8 @@ def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_o
             environment["HERDR_TRUSTED_ORIGINS"] = trusted_origins
         if shell_panes is not None:
             environment["HERDR_SHELL_PANES"] = shell_panes
+        if ssh_control_path is not False:
+            environment["HERDR_SSH_CONTROL_PATH"] = ssh_control_path
 
         with mock.patch.dict(os.environ, environment, clear=False), mock.patch.dict(
             sys.modules, _websockets_stubs(), clear=False
@@ -107,8 +119,10 @@ def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_o
                 ("HERDR_RELAY_TOKEN", relay_token),
                 ("HERDR_TRUSTED_ORIGINS", trusted_origins),
                 ("HERDR_SHELL_PANES", shell_panes),
+                ("HERDR_SSH_CONTROL_PATH",
+                 False if ssh_control_path is False else ssh_control_path),
             ):
-                if value is None:
+                if value is None or value is False:
                     os.environ.pop(name, None)
 
             spec = importlib.util.spec_from_file_location(module_name, RELAY_PATH)
@@ -3165,10 +3179,10 @@ class RelaySshMultiplexingTests(unittest.TestCase):
             self.assertIn("ControlMaster=auto", args)
             self.assertIn("ControlPersist=60s", args)
             control_path = next(a for a in args if a.startswith("ControlPath="))
-            # %C hashes user/host/port to a fixed width so the socket path stays inside the
-            # ~104-byte AF_UNIX limit.
+            # %C hashes user/host/port to a fixed 40-char width so the socket path stays inside
+            # the ~104-byte AF_UNIX limit once ssh appends its own master suffix.
             self.assertTrue(control_path.endswith("%C"), control_path)
-            self.assertLess(len(control_path), 104)
+            self.assertTrue(relay._control_path_fits(control_path))
             # Options first, then the target, then the remote binary -- callers index on that.
             self.assertEqual(args[:4], ["-o", "ConnectTimeout=5", "-o", "BatchMode=yes"])
 
@@ -4558,6 +4572,242 @@ class RelayIdAllowlistEventQueueTests(unittest.IsolatedAsyncioTestCase):
                 update = next(m for m in messages if m["type"] == "agent_update")
                 self.assertEqual(update["agent"]["pane_id"], pane_id)
                 self.assertEqual(relay.agent_cache[pane_id]["pane_id"], pane_id)
+
+
+class RelayMachineDiscoveryTests(unittest.TestCase):
+    """`herdr machine list` feeds the SSH-polled remote list, cached and fail-sticky."""
+
+    MACHINES_JSON = json.dumps([
+        {"id": "a" * 32, "label": "one", "target": "user@host1",
+         "session": "default", "enabled": True, "selected": False},
+        {"id": "b" * 32, "label": "two", "target": "host2",
+         "session": "default", "enabled": False, "selected": False},
+        {"id": "c" * 32, "label": "three", "target": "host3",
+         "session": "default", "enabled": True},
+        # No usable target: skipped rather than become an empty SSH target.
+        {"id": "d" * 32, "label": "four", "enabled": True},
+        "not-a-dict",
+    ])
+    MACHINES_TABLE = (
+        "id                                label  target    profile  status\n"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  one    host1     default  enabled\n"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  two    host2     default  disabled\n"
+        "malformed row\n"
+    )
+
+    def test_json_parse_keeps_only_enabled_targets(self):
+        with loaded_relay() as relay:
+            self.assertEqual(relay.parse_machine_list(self.MACHINES_JSON),
+                             ["user@host1", "host3"])
+
+    def test_table_fallback_parses_and_skips_header_and_bad_rows(self):
+        with loaded_relay() as relay:
+            self.assertEqual(relay.parse_machine_list(self.MACHINES_TABLE), ["host1"])
+
+    def test_unusable_output_is_an_empty_list_not_an_error(self):
+        with loaded_relay() as relay:
+            for raw in ("", "   ", "not json at all", "[]"):
+                self.assertEqual(relay.parse_machine_list(raw), [])
+
+    @staticmethod
+    def _patch_machines(relay, stdout, returncode=0):
+        return mock.patch.object(
+            relay, "run_herdr_result",
+            return_value=subprocess.CompletedProcess([], returncode, stdout=stdout, stderr=""))
+
+    def test_a_refresh_merges_discovered_machines_into_remotes(self):
+        with mock.patch.dict(os.environ, {"HERDR_REMOTES": "explicit-box"}), \
+             loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON):
+                merged = relay.refresh_remote_machines(force=True)
+            # Explicit env targets lead; duplicates would be listed once.
+            self.assertEqual(merged, ["explicit-box", "user@host1", "host3"])
+            self.assertEqual(relay.REMOTES, merged)
+
+    def test_env_entries_are_added_not_replaced(self):
+        with mock.patch.dict(os.environ, {"HERDR_REMOTES": "a@x,b@y"}), \
+             loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON):
+                merged = relay.refresh_remote_machines(force=True)
+            self.assertEqual(merged, ["a@x", "b@y", "user@host1", "host3"])
+
+    def test_a_target_in_both_lists_is_listed_once_with_env_first(self):
+        with mock.patch.dict(os.environ, {"HERDR_REMOTES": "host3"}), \
+             loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON):
+                merged = relay.refresh_remote_machines(force=True)
+            self.assertEqual(merged, ["host3", "user@host1"])
+
+    def test_discovery_uses_json_then_falls_back_to_the_table(self):
+        with loaded_relay() as relay:
+            calls = []
+
+            def fake_result(*args):
+                calls.append(args)
+                if "--json" in args:
+                    # An older herdr: clap exits 2 on an unknown flag.
+                    return subprocess.CompletedProcess([], 2, stdout="", stderr="unknown flag")
+                return subprocess.CompletedProcess([], 0, stdout=self.MACHINES_TABLE, stderr="")
+
+            with mock.patch.object(relay, "run_herdr_result", side_effect=fake_result):
+                merged = relay.refresh_remote_machines(force=True)
+            self.assertEqual(merged, ["host1"])
+            self.assertEqual([c[:2] for c in calls],
+                             [("machine", "list"), ("machine", "list")])
+
+    def test_a_failed_refresh_keeps_the_last_good_set(self):
+        with loaded_relay() as relay:
+            good = self._patch_machines(relay, self.MACHINES_JSON)
+            with good:
+                relay.refresh_remote_machines(force=True)
+            with self._patch_machines(relay, "", returncode=1):
+                merged = relay.refresh_remote_machines(force=True)
+            # The one bad invocation must not zero out the remotes for a poll.
+            self.assertEqual(merged, ["user@host1", "host3"])
+
+    def test_a_successful_empty_read_really_clears_discovered_remotes(self):
+        # None (couldn't read) is sticky; "[]" means the operator genuinely has no enabled
+        # machines and the entries must go. Env targets survive either way.
+        with mock.patch.dict(os.environ, {"HERDR_REMOTES": "explicit-box"}), \
+             loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON):
+                relay.refresh_remote_machines(force=True)
+            with self._patch_machines(relay, "[]"):
+                merged = relay.refresh_remote_machines(force=True)
+            self.assertEqual(merged, ["explicit-box"])
+
+    def test_discovery_is_cached_between_ticks(self):
+        with loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON) as read:
+                relay.refresh_remote_machines(force=True)   # the one read
+                for _ in range(10):
+                    relay.refresh_remote_machines()        # all cached
+            self.assertEqual(read.call_count, 1)
+
+    def test_poll_ticks_do_not_invoke_discovery_every_time(self):
+        with loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON) as read, \
+                 mock.patch.object(relay, "get_all_panes", return_value=([], [])), \
+                 mock.patch.object(relay, "refresh_spaces",
+                                   return_value={"workspaces": [], "tabs": []}), \
+                 mock.patch.object(relay, "broadcast", new=mock.AsyncMock()):
+                asyncio.run(relay._poll_once())
+                asyncio.run(relay._poll_once())
+            # First poll populates the cache; the second must not re-read.
+            self.assertEqual(read.call_count, 1)
+
+    def test_discovery_can_be_disabled(self):
+        with mock.patch.dict(os.environ, {"HERDR_NO_MACHINE_DISCOVERY": "1",
+                                         "HERDR_REMOTES": "only-box"}), \
+             loaded_relay() as relay:
+            with self._patch_machines(relay, self.MACHINES_JSON) as read:
+                merged = relay.refresh_remote_machines(force=True)
+            read.assert_not_called()
+            self.assertEqual(merged, ["only-box"])
+
+    def test_loopback_and_self_entries_are_skipped(self):
+        with loaded_relay() as relay:
+            self.assertIn("localhost", relay._self_ssh_targets())
+            machines = json.dumps([
+                {"target": "localhost", "enabled": True},
+                {"target": "127.0.0.1", "enabled": True},
+                {"target": "me@::1", "enabled": True},
+                {"target": "real-box", "enabled": True},
+            ])
+            with self._patch_machines(relay, machines):
+                merged = relay.refresh_remote_machines(force=True)
+            self.assertEqual(merged, ["real-box"])
+
+    def test_a_machine_named_like_this_host_is_skipped(self):
+        with loaded_relay() as relay:
+            machines = json.dumps([
+                {"target": "this-mac", "enabled": True},
+                {"target": "user@this-mac.example.com", "enabled": True},
+                {"target": "real-box", "enabled": True},
+            ])
+            with mock.patch.object(relay.socket, "gethostname",
+                                   return_value="this-mac.example.com"):
+                with self._patch_machines(relay, machines):
+                    merged = relay.refresh_remote_machines(force=True)
+        self.assertEqual(merged, ["real-box"])
+
+
+class RelaySshControlPathTests(unittest.TestCase):
+    """The ControlPath length bug and the runtime degradation when a master cannot be created."""
+
+    def test_the_expanded_socket_is_measured_not_the_literal_template(self):
+        with loaded_relay() as relay:
+            # A literal 91-char template used to pass the old "> 90" check even though %C expands
+            # to 40 chars and ssh appends a 17-char suffix: 91 - 2 + 40 + 17 = 146.
+            template = "/tmp/" + ("a" * 79) + "/ssh-%C"
+            self.assertEqual(len(template), 91)
+            self.assertFalse(relay._control_path_fits(template))
+            self.assertTrue(relay._control_path_fits("/tmp/herdr-remote-%C"))
+
+    def test_a_long_override_disables_multiplexing(self):
+        long_path = "/tmp/" + ("a" * 79) + "/ssh-%C"
+        with loaded_relay(ssh_control_path=long_path) as relay:
+            self.assertIsNone(relay.SSH_CONTROL_PATH)
+            self.assertFalse(any(a.startswith("ControlMaster") for a in relay.SSH_BASE_ARGS))
+            self.assertFalse(any(a.startswith("ControlPath") for a in relay.SSH_BASE_ARGS))
+
+    def test_the_default_lives_in_a_short_directory_without_an_override(self):
+        # The log dir under ~/Library/Logs is the bug; the default must resolve somewhere short
+        # enough on its own.
+        with loaded_relay(ssh_control_path=False) as relay:
+            if sys.platform == "win32":
+                self.assertIsNone(relay.SSH_CONTROL_PATH)
+            else:
+                self.assertIsNotNone(relay.SSH_CONTROL_PATH)
+                self.assertTrue(
+                    relay.SSH_CONTROL_PATH.startswith(os.path.expanduser("~/.ssh/")),
+                    relay.SSH_CONTROL_PATH,
+                )
+                self.assertTrue(relay._control_path_fits(relay.SSH_CONTROL_PATH))
+                self.assertIn("ControlMaster=auto", relay.SSH_BASE_ARGS)
+
+    def test_a_master_creation_failure_retries_without_multiplexing(self):
+        master_error = (
+            'unix_listener: path "/Users/me/Library/Logs/herdr-remote/ssh-x.Rrrrrrrrrrrrrrrr" '
+            "too long for Unix domain socket\r\n"
+        )
+        with loaded_relay() as relay:
+            commands = []
+
+            def fake_run(cmd, **kwargs):
+                commands.append(cmd)
+                # broken-box's first (master-carrying) call fails exactly the way ssh fails; once
+                # the relay degrades it the plain retries answer. healthy-box never fails.
+                if ("broken-box" in cmd and "broken-box" not in relay._ssh_master_disabled
+                        and any(a.startswith("ControlMaster") for a in cmd)):
+                    return subprocess.CompletedProcess(cmd, 255, stdout="", stderr=master_error)
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+
+            with mock.patch.object(relay.subprocess, "run", side_effect=fake_run):
+                first = relay.run_herdr_result("pane", "list", remote="broken-box")
+                second = relay.run_herdr_result("pane", "list", remote="broken-box")
+                other = relay.run_herdr_result("pane", "list", remote="healthy-box")
+
+            self.assertNotEqual(first.returncode, 0)
+            self.assertEqual(second.returncode, 0)
+            self.assertEqual(other.returncode, 0)
+            self.assertIn("broken-box", relay._ssh_master_disabled)
+            self.assertNotIn("healthy-box", relay._ssh_master_disabled)
+            # The degraded command is a plain ssh: none of the three multiplexing options.
+            degraded = commands[1]
+            self.assertFalse(any(a.startswith(("ControlMaster", "ControlPath",
+                                               "ControlPersist")) for a in degraded))
+            # The healthy host keeps its master options.
+            self.assertTrue(any(a.startswith("ControlMaster") for a in commands[2]))
+
+    def test_an_unrelated_ssh_failure_keeps_multiplexing(self):
+        with loaded_relay() as relay:
+            failed = subprocess.CompletedProcess(
+                [], 255, stdout="", stderr="user@host: Permission denied (publickey).\r\n")
+            with mock.patch.object(relay.subprocess, "run", return_value=failed):
+                relay.run_herdr_result("pane", "list", remote="locked-box")
+            self.assertNotIn("locked-box", relay._ssh_master_disabled)
+            self.assertEqual(relay._ssh_args("locked-box"), relay.SSH_BASE_ARGS)
 
 
 if __name__ == "__main__":
