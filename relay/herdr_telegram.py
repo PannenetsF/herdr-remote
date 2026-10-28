@@ -278,7 +278,10 @@ def _cell_truncate(s: str, budget: int) -> str:
             break
         out.append(ch)
         used += step
-    return "".join(out).rstrip() + "\u2026"
+    kept = "".join(out).rstrip()
+    # A title herdr itself ellipsized must not gain a second ellipsis
+    # (it renders as "……"); the reserved truncation cell is spent once.
+    return kept if kept.endswith("\u2026") else kept + "\u2026"
 
 
 def _html_escape(s: str) -> str:
@@ -1278,23 +1281,27 @@ def bar_label_pane(text: str) -> tuple[str, str | None]:
     return "", None
 
 
-# --- /switch: project-tagged focus selector --------------------------------
+# --- /switch: two-line focus selector ---------------------------------------
 #
 # pf.4: the project lives inside every pane row (a ▸ header row scrolls away on
 # a phone), hpc-<own project> coordinator names collapse to "coord" so the row
 # is not twice the same slug, and the four status chips stay short enough for
 # one phone-width row.
-# pf.5: budgets are display *cells* (CJK/emoji = 2), measured against an iPhone
-# inline button (~40 half-width cells) -- u16 budgets let CJK titles render at
-# double the button width. Only the first pane of each project on a page keeps
-# the project tag; continuation rows spend the width on the title instead.
-# Title gets a reserved minimum and the project shrinks first; pane id and
-# session are the tail that is never cut.
-
+# pf.5: budgets are display *cells* (CJK/emoji = 2) -- u16 budgets let CJK
+# titles render at double the button width.
+# pf.8: one shared line could not hold topic + project + pane + session: the
+# fixed tail (~18 cells) and project tag starved the title to ~11 cells, so the
+# discriminating part of long CJK topics ("...续训对照 MTP" vs "...BF16 C4
+# 评测交接") was always the part cut. The button is now TWO lines: the topic
+# owns a whole line, and "project › pane · session @host" sits under it. Each
+# line independently obeys the phone button width; on the meta line the project
+# is the only thing that shrinks and it disappears (rather than clipping the
+# identity tail) when it cannot fit.
+#
+# SWITCH_LABEL_CELLS is a per-LINE budget (Telegram clips any overflowing line
+# itself, which would hide the pane/session tail).
 SWITCH_PAGE_SIZE = 10             # pane rows per /switch page
-SWITCH_LABEL_CELLS = 40           # half-width cells of a phone inline button
-SWITCH_PROJECT_MIN_CELLS = 6      # project keeps at least that when title exists
-SWITCH_TITLE_MIN_CELLS = 12       # title is reserved that much before project
+SWITCH_LABEL_CELLS = 40           # half-width cells of one phone-button line
 SWITCH_SESSION_CELLS = 18
 SWITCH_HOST_CELLS = 10
 SWITCH_FILTERS = ("all", "blocked", "working", "idle")
@@ -1363,54 +1370,44 @@ def _short_session(rec: dict, project: str) -> str:
     return session
 
 
-def _switch_pane_label(rec: dict, show_project: bool = True) -> str:
-    """glyph [project›]title (pane)·session@host, budgeted in display cells.
+def _switch_pane_label(rec: dict) -> str:
+    """Two-line phone button, each line within SWITCH_LABEL_CELLS display cells.
 
-    Layout (no spaces around ›/·):
-      tagged row:  glyph project›title (pane)·session @host
-      continuation: glyph title (pane)·session @host
-    The free-form title gets a reserved minimum on tagged rows; the project
-    is the first component cut. Pane id and session form a tail that is never
-    shortened by the title budget (session itself caps at
-    SWITCH_SESSION_CELLS), so any row resolves to exactly one pane.
+      line 1: glyph <topic title>            (full line; the title IS the
+              conversation and the primary discriminator)
+      line 2: <project> › <pane_id> · <session> @host
+              (project is the only shrinkable part and drops entirely before
+              the pane/session identity tail can be clipped)
+
+    A title-less pane puts the project on line 1 (its sole readable cue) and
+    keeps line 2 to pane · session so the slug is not printed twice.
     """
     project = effective_project(rec)
     glyph = STATUS_GLYPH.get(rec.get("status", "unknown"), "💤")
     session = _cell_truncate(_short_session(rec, project), SWITCH_SESSION_CELLS)
     host = rec.get("host") or "local"
     host_part = (
-        f"@{_cell_truncate(host, SWITCH_HOST_CELLS)}" if host != "local" else ""
+        f" @{_cell_truncate(host, SWITCH_HOST_CELLS)}" if host != "local" else ""
     )
     pane_id = str(rec.get("pane_id") or "?")
     title = (rec.get("title") or "").strip()
-    prefix = f"{glyph} "
-    tail = f"({pane_id})·{session}{host_part}"
-    room = SWITCH_LABEL_CELLS - _cell_len(prefix) - _cell_len(tail) - 1  # space
 
-    if not show_project:
-        if title and room >= 6:
-            return f"{prefix}{_cell_truncate(title, room)} {tail}"
-        return f"{prefix}{tail}"
-
-    if not title:
-        return f"{prefix}{_cell_truncate(project, max(room, 0))} {tail}"
-
-    pc = _cell_len(project)
-    if pc + 1 + _cell_len(title) <= room:
-        return f"{prefix}{project}›{title} {tail}"
-
-    # Both do not fit: title first, project absorbs the remainder (min 6).
-    title_budget = min(_cell_len(title), max(SWITCH_TITLE_MIN_CELLS, room - 1 - SWITCH_PROJECT_MIN_CELLS))
-    proj_budget = room - 1 - title_budget
-    if proj_budget < 4:
-        # Even a minimal project leaves no usable title: skip the title.
-        return f"{prefix}{_cell_truncate(project, max(room, 0))} {tail}"
-    if title_budget < 4:
-        return f"{prefix}{_cell_truncate(project, max(room, 0))} {tail}"
-    return (
-        f"{prefix}{_cell_truncate(project, proj_budget)}›"
-        f"{_cell_truncate(title, title_budget)} {tail}"
+    head = f"{glyph} "
+    line1 = head + _cell_truncate(
+        title or project, SWITCH_LABEL_CELLS - _cell_len(head)
     )
+
+    tail = f"{pane_id} · {session}{host_part}"
+    if title:
+        # " › " costs 3 cells; a project tag shorter than 4 cells is noise.
+        room = SWITCH_LABEL_CELLS - _cell_len(tail) - 3
+        if room >= 4:
+            line2 = f"{_cell_truncate(project, room)} › {tail}"
+        else:
+            line2 = tail
+    else:
+        line2 = tail
+    return f"{line1}\n{line2}"
 
 
 def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") -> InlineKeyboardMarkup:
@@ -1422,18 +1419,15 @@ def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") 
     page = min(max(page, 0), page_count - 1)
     visible = panes[page * SWITCH_PAGE_SIZE:(page + 1) * SWITCH_PAGE_SIZE]
 
-    # Tag the first pane of each project on THIS page; continuation rows spend
-    # the cells on the title. A group straddling a page break is re-tagged.
-    keyboard = []
-    tagged_on_page: set[str] = set()
-    for rec in visible:
-        project = effective_project(rec)
-        show_project = project not in tagged_on_page
-        tagged_on_page.add(project)
-        keyboard.append([InlineKeyboardButton(
-            _switch_pane_label(rec, show_project=show_project),
+    # Every button carries its own meta line (project › pane · session): the
+    # two-line layout gives the topic a whole line, so nothing needs sharing.
+    keyboard = [
+        [InlineKeyboardButton(
+            _switch_pane_label(rec),
             callback_data=pane_callback_data("switch", rec["pane_id"]),
-        )])
+        )]
+        for rec in visible
+    ]
 
     keyboard.append([
         InlineKeyboardButton(

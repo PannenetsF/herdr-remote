@@ -1679,7 +1679,7 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         nav = next(b for b in self._flatten(first) if b.text == "Next")
         self.assertEqual(json.loads(nav.callback_data)["page"], 1)
 
-    # --- pf.4/pf.5: project-tagged rows, coord collapse, cell-width budget -
+    # --- pf.4/pf.5: coord collapse, cell budgets; pf.8: two-line buttons ------
 
     def _switch_rows(self, markup):
         return [b for b in self._flatten(markup)
@@ -1689,24 +1689,25 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         tg.agents = [
             coord_rec("w:1", "lagrange-system"),
             _rec("w:2", label="hpc-lagrange-system-2", project="lagrange-system",
-                 cwd="/u/lagrange-system"),
+                 cwd="/u/lagrange-system", title="lagrange-system work"),
             _rec("w:3", label="hpc-other-project", project="lagrange-system",
-                 cwd="/u/lagrange-system"),
+                 cwd="/u/lagrange-system", title="unrelated topic"),
         ]
         labels = {
             tg.parse_callback_data(b.callback_data)["pane_id"]: b.text
             for b in self._switch_rows(tg.build_switch_keyboard())
         }
-        self.assertTrue(labels["w:1"].endswith("·coord"))
-        self.assertIn("·coord-2", labels["w:2"])
+        self.assertTrue(labels["w:1"].splitlines()[1].endswith("· coord"))
+        self.assertIn("· coord-2", labels["w:2"])
         self.assertIn("hpc-other-project", labels["w:3"])
-        # only the first pane of the project on the page carries the tag;
-        # project and title share the tagged row so the slug truncates first
-        tagged = [t for t in labels.values() if "›" in t]
-        self.assertEqual(len(tagged), 1)
-        self.assertTrue(tagged[0].startswith("▶️ lagra…›"))
-        for pid in ("w:2", "w:3"):
-            self.assertNotIn("lagrange", labels[pid].split(" (")[0])
+        # pf.8: project lives on each button's second line (topic owns line 1),
+        # so every lagrange row names it there instead of one tagged row.
+        for pid in ("w:1", "w:2"):
+            line1, line2 = labels[pid].splitlines()
+            self.assertTrue(line1.endswith("work"))  # topic owns the first line
+            self.assertIn("lagrange", line2)
+            self.assertIn(pid, line2)
+        self.assertIn("›", labels["w:1"])
 
     def test_short_session_handles_namesrs_truncated_names(self):
         long_slug = "a-very-long-project-slug-indeed"  # 29 chars
@@ -1726,41 +1727,51 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
                  cwd="/u/lagrange-system", title="短标题"),
         ]
         for rec in cases:
-            for show in (True, False):
-                label = tg._switch_pane_label(rec, show_project=show)
-                self.assertLessEqual(
-                    tg._cell_len(label), tg.SWITCH_LABEL_CELLS, label
-                )
-                # pane id and session tail are never destroyed
-                self.assertIn(f"({rec['pane_id']})·", label)
+            label = tg._switch_pane_label(rec)
+            line1, line2 = label.splitlines()
+            # pf.8: the budget is per LINE (Telegram clips any overflowing
+            # line itself), and the identity tail lives intact on line 2.
+            self.assertEqual(len(label.splitlines()), 2)
+            self.assertLessEqual(tg._cell_len(line1), tg.SWITCH_LABEL_CELLS, label)
+            self.assertLessEqual(tg._cell_len(line2), tg.SWITCH_LABEL_CELLS, label)
+            # pane id and session tail are never destroyed
+            self.assertIn(rec["pane_id"], line2)
+            self.assertIn("·", line2)
 
-    def test_continuation_row_spends_cells_on_the_cjk_title(self):
+    def test_topic_line_holds_what_the_old_shared_row_had_to_cut(self):
         rec = _rec("w:1", label="hpc-lagrange-system", status="working",
                    project="lagrange-system", cwd="/u/lagrange-system",
                    title="byted_vllm 性能测试方案")
-        tagged = tg._switch_pane_label(rec, True)
-        cont = tg._switch_pane_label(rec, False)
-        self.assertIn("›", tagged)
-        self.assertNotIn("lagrange", cont)
-        # the continuation keeps the latin head and two CJK glyphs the tagged
-        # row cannot afford
-        self.assertIn("byted_vllm", cont)
-        self.assertIn("性能", cont)
-        self.assertGreater(
-            tg._cell_len(cont.split(" (")[0]),
-            tg._cell_len(tagged.split("›")[1].split(" (")[0]),
-        )
+        line1, line2 = tg._switch_pane_label(rec).splitlines()
+        # The whole topic fits on its own line (25 cells < the 40 budget)...
+        self.assertIn("byted_vllm 性能测试方案", line1)
+        self.assertNotIn("…", line1)
+        # ...and the meta line independently keeps project, pane and session.
+        self.assertEqual(line2, "lagrange-system › w:1 · coord")
 
-    def test_project_is_retagged_on_every_page(self):
+    def test_long_topic_truncates_on_line_one_without_double_ellipsis(self):
+        rec = _rec("w:1", label="hpc-lagrange-system", status="working",
+                   project="lagrange-system", cwd="/u/lagrange-system",
+                   title="Qwen3.8-27B DFlash2 续训对照 MTP 精度对齐全量回归")
+        line1, line2 = tg._switch_pane_label(rec).splitlines()
+        self.assertLessEqual(tg._cell_len(line1), tg.SWITCH_LABEL_CELLS)
+        self.assertIn("Qwen3.8-27B", line1)
+        self.assertNotIn("……", line1)
+        self.assertIn("lagrange-system › w:1 · coord", line2)
+
+    def test_every_pane_button_is_two_lines_with_project_on_each_page(self):
         tg.agents = [
             coord_rec(f"w:p{i:02d}", "same-project",
                       status=("blocked" if i % 3 == 0 else "working"))
             for i in range(tg.SWITCH_PAGE_SIZE + 2)
         ]
-        first = [b.text for b in self._switch_rows(tg.build_switch_keyboard(page=0))]
-        second = [b.text for b in self._switch_rows(tg.build_switch_keyboard(page=1))]
-        self.assertEqual(sum("›" in t for t in first), 1)
-        self.assertEqual(sum("›" in t for t in second), 1)
+        for page in (0, 1):
+            rows = [b.text for b in self._switch_rows(tg.build_switch_keyboard(page=page))]
+            self.assertTrue(rows)
+            for text in rows:
+                line1, line2 = text.splitlines()
+                self.assertIn("same-project ›", line2)
+                self.assertNotIn("›", line1)
 
     def test_filter_chips_are_two_cjk_chars_and_one_row(self):
         self._herd()
