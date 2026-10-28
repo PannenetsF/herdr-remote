@@ -1393,6 +1393,12 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         await tg.refresh_bar(bot)
         self.assertEqual(bot.sent, [])
 
+    def test_placeholder_is_the_invisible_char_telegram_accepts(self):
+        # Bot API rejects bodies made solely of U+200B/U+2800/U+1160/U+3164/
+        # nbsp/ZWNJ/ZWNBSP ("text must be non-empty"); U+2060 WORD JOINER is
+        # the one invisible char that survives the trim (verified 2026-10).
+        self.assertEqual(tg.BAR_PLACEHOLDER, "⁠")
+
     # --- free text routing ------------------------------------------------
 
     async def test_plain_text_without_focus_opens_selector_sends_nothing(self):

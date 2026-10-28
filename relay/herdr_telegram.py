@@ -89,10 +89,11 @@ SWITCH_PAGE_SIZE = 10             # rows per /switch page, group headers include
 RECENT_MAX = 8                    # recent panes persisted in the state file
 RECENT_BAR_SLOTS = 3              # recent panes shown on the persistent bar
 BAR_MIN_INTERVAL = 1.0            # fastest cadence of silent bar refreshes
-# Telegram strips a bare U+200B and rejects the message ("Text must be
-# non-empty"); U+2800 braille blank survives the trim while rendering empty.
-# The placeholder is deleted immediately anyway.
-BAR_PLACEHOLDER = "\u2800"
+# Telegram rejects a body made only of U+200B/U+2800/U+1160/U+3164/nbsp/
+# ZWNJ/ZWNBSP ("Text must be non-empty" / MESSAGE_EMPTY); empirically only
+# U+2060 WORD JOINER survives the trim while rendering empty. The placeholder
+# is deleted immediately anyway.
+BAR_PLACEHOLDER = "\u2060"
 BAR_SWITCH_LABEL = "📋 切换 session"
 BAR_DASHBOARD_LABEL = "📊 Dashboard"
 BAR_UNFOCUS_LABEL = "✖ 取消聚焦"
