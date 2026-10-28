@@ -1293,6 +1293,7 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         tg.blocked_prompt_ids.clear()
         tg.prev_statuses.clear()
         tg.pane_messages.clear()
+        tg.read_views.clear()
         tg.done_at.clear()
         reset_focus_state()
 
@@ -1300,6 +1301,7 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         tg.CHAT_ID = self.old_chat_id
         tg.agents = []
         tg.relay_connected = False
+        tg.read_views.clear()
         reset_focus_state()
 
     def _herd(self):
@@ -1520,7 +1522,7 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(tg.active_pane)
         self.assertIn("取消", message.replies[0][0])
 
-    async def test_recent_tap_refocuses_and_prompts(self):
+    async def test_recent_tap_refocuses_and_shows_preview(self):
         self._herd()
         tg.focus_pane("wT:pA")
         tg.focus_pane("wT:pB")
@@ -1529,14 +1531,32 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         label = "🔄 " + recents[0][0]
         message = FakeMessage()
         message.text = label
-        await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        with patch.object(tg, "read_agent",
+                          AsyncMock(return_value=("<b>agent</b>\n预览正文", False))):
+            await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
         self.assertEqual(tg.active_pane, recents[0][1]["pane_id"])
-        self.assertIn("已聚焦", message.replies[0][0])
-        self.assertIsInstance(message.replies[0][1]["reply_markup"], tg.ForceReply)
+        text, kwargs = message.replies[0][0], message.replies[0][1]
+        # pf.6: the focus confirmation carries the transcript preview, not a bare
+        # one-liner, and no ForceReply (the persistent bar owns the input hint).
+        self.assertIn("已聚焦", text)
+        self.assertIn("预览正文", text)
+        self.assertNotIn("reply_markup", kwargs)
+
+    async def test_active_tap_shows_preview_without_changing_focus(self):
+        self._herd()
+        tg.focus_pane("wT:pA")
+        active_item, _recents = tg._bar_specs()
+        message = FakeMessage()
+        message.text = "🎯 " + active_item[0]
+        with patch.object(tg, "read_agent",
+                          AsyncMock(return_value=("<b>agent</b>\n当前对话", False))):
+            await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+        self.assertEqual(tg.active_pane, "wT:pA")
+        self.assertIn("当前对话", message.replies[0][0])
 
     # --- /switch selector --------------------------------------------------
 
-    async def test_switch_selection_focuses_and_followup_text_routes(self):
+    async def test_switch_selection_focuses_shows_preview_and_routes_followup(self):
         self._herd()
         button = tg.build_switch_keyboard().inline_keyboard
         # find the lagrange coordinator pane row (skip headers)
@@ -1545,17 +1565,43 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         target = next(b for b in pane_buttons
                       if tg.parse_callback_data(b.callback_data)["pane_id"] == "wT:pA")
         callback = FakeCallback(target.callback_data)
-        await tg.handle_callback(make_update(callback=callback), make_context(bot=FakeBot()))
+        with patch.object(tg, "read_agent",
+                          AsyncMock(return_value=("<b>agent</b>\n最新进展", False))):
+            await tg.handle_callback(make_update(callback=callback),
+                                     make_context(bot=FakeBot()))
 
         self.assertEqual(tg.active_pane, "wT:pA")
         self.assertEqual(tg.recent_panes[0], "wT:pA")
+        # pf.6: the selection posts the focus header WITH the transcript preview.
         self.assertIn("已聚焦", callback.message.replies[0][0])
+        self.assertIn("最新进展", callback.message.replies[0][0])
 
         follow = FakeMessage()
         follow.text = "do the thing"
         with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
             await tg.handle_text(make_update(message=follow), make_context(bot=FakeBot()))
         send_text.assert_awaited_once_with("wT:pA", "do the thing")
+
+    async def test_reselect_same_pane_edits_preview_in_place(self):
+        self._herd()
+        bot = FakeBot()
+        button = tg.build_switch_keyboard().inline_keyboard
+        pane_buttons = [row[0] for row in button
+                        if tg.parse_callback_data(row[0].callback_data).get("action") == "switch"]
+        target = next(b for b in pane_buttons
+                      if tg.parse_callback_data(b.callback_data)["pane_id"] == "wT:pA")
+        preview = AsyncMock(return_value=("<b>agent</b>\n预览", False))
+        with patch.object(tg, "read_agent", preview):
+            first = FakeCallback(target.callback_data)
+            await tg.handle_callback(make_update(callback=first), make_context(bot=bot))
+            second = FakeCallback(target.callback_data)
+            await tg.handle_callback(make_update(callback=second), make_context(bot=bot))
+        self.assertEqual(preview.await_count, 2)
+        # One new view message, then an in-place edit -- no second card in the chat.
+        self.assertEqual(len(first.message.replies), 1)
+        self.assertEqual(len(second.message.replies), 0)
+        self.assertTrue(any("已聚焦" in text and "预览" in text
+                            for _c, _mid, text, _k in bot.edits))
 
     def test_switch_keyboard_groups_and_filters(self):
         self._herd()

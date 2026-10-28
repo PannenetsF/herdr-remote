@@ -550,7 +550,8 @@ def pending_pane(chat_id: int, message_id: int) -> str | None:
 READ_VIEW_MAX = 3500
 
 
-async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, content: str):
+async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str,
+                         content: str, footer: str | None = None):
     """One live-view message per pane, edited in place on every read.
 
     Repeated /read of the same agent used to post a fresh message each time, so a few commands
@@ -561,6 +562,8 @@ async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str, 
     one is gone (deleted, or too old for Telegram to edit).
     """
     text = f"<b>{_html_escape(header)}</b>\n{content}"
+    if footer:
+        text += f"\n\n<i>{_html_escape(footer)}</i>"
     key = (int(chat_id), pane_id)
     existing = read_views.get(key)
     if existing is not None:
@@ -1439,20 +1442,27 @@ def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") 
     return InlineKeyboardMarkup(keyboard)
 
 
-async def send_focus_prompt(message, chat, rec: dict):
-    """Confirm the new focus and (private chats) raise the reply box."""
-    title = agent_identity(rec)
-    text = (
-        f"🎯 <b>{_html_escape(title)}</b>\n"
-        "已聚焦：之后直接输入消息即可，不需要 reply 任何消息。"
+FOCUS_VIEW_FOOTER = (
+    "已聚焦：直接输入消息即发送到该 session，不需要 reply；再点一次该 session 可刷新预览。"
+)
+
+
+async def send_focus_view(bot, message, chat, rec: dict):
+    """Focus a pane and open its one reusable transcript-preview message.
+
+    pf.6: picking a session from /switch or the bottom bar used to post only a
+    "已聚焦" one-liner, so the conversation preview was an extra 📖 Read tap away.
+    Selection now renders the same transcript view as Read; repeated picks of the
+    same pane edit that message in place (see show_pane_view) instead of
+    burying the chat.
+    """
+    pane_id = rec["pane_id"]
+    header = f"🎯 {agent_identity(rec)} · 已聚焦"
+    content, _is_raw = await read_agent(pane_id)
+    return await show_pane_view(
+        bot, chat.id, message, pane_id, header, content,
+        footer=FOCUS_VIEW_FOOTER,
     )
-    kwargs = {"parse_mode": "HTML"}
-    if getattr(chat, "type", None) == "private":
-        kwargs["reply_markup"] = ForceReply(
-            selective=True,
-            input_field_placeholder=_u16_truncate("消息发往 " + title, 63),
-        )
-    return await message.reply_text(text, **kwargs)
 
 
 def receipt_keyboard(pane_id: str) -> InlineKeyboardMarkup:
@@ -1961,7 +1971,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bot = getattr(ctx, "bot", None)
         if bot is not None:
             await refresh_bar(bot, force=True)
-        await send_focus_prompt(query.message, update.effective_chat, selected)
+        await send_focus_view(bot, query.message, update.effective_chat, selected)
         return
 
     selected_agent = None
@@ -2195,7 +2205,7 @@ async def handle_bar_tap(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         bot = getattr(ctx, "bot", None)
         if bot is not None:
             await refresh_bar(bot, force=True)
-        await send_focus_prompt(message, update.effective_chat, rec)
+        await send_focus_view(bot, message, update.effective_chat, rec)
         return
     if kind == "active":
         rec = find_agent(pane_id) if pane_id else None
@@ -2204,10 +2214,9 @@ async def handle_bar_tap(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                                      reply_markup=build_switch_keyboard())
             unfocus_pane()
             return
-        await message.reply_text(
-            f"🎯 当前消息发往 <b>{_html_escape(agent_identity(rec))}</b>\n"
-            "直接输入即可；点 ✖ 取消聚焦 或用 /switch 切换。",
-            parse_mode="HTML",
+        # Same preview surface as picking from /switch, without changing focus.
+        await send_focus_view(
+            getattr(ctx, "bot", None), message, update.effective_chat, rec
         )
 
 
