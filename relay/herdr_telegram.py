@@ -636,6 +636,27 @@ def agent_identity(rec: dict) -> str:
     return " > ".join((effective_project(rec), pane_descriptor(rec), session))
 
 
+def pane_focus_identity(rec: dict) -> str:
+    """Identity for a single-pane surface (the focus preview), pane-anchored.
+
+    Semantics differ from agent_identity's three-level notification header:
+    when naming ONE conversation, the pane title IS the conversation -- it is
+    the 1:1 human-readable topic (live herds put most panes in one project, so
+    the slug barely discriminates anything) -- and the pane id is its stable
+    key (terminal titles mutate while the pane lives). Project is the coarse
+    grouping the selector row already showed and hpc-<slug> merely repeats it,
+    so both are dropped from the default, leaving the short runtime tag
+    (claude/codex/coord-N). Project survives only when the pane has no title,
+    where it is the sole readable cue.
+    """
+    project = effective_project(rec)
+    pane_id = rec.get("pane_id") or "?"
+    title = (rec.get("title") or "").strip()
+    head = title or project
+    session = _short_session(rec, project)
+    return f"{head} ({pane_id}) · {session}"
+
+
 def identity_for_blocked(msg: dict) -> str:
     rec = find_agent(msg.get("pane_id", ""))
     if rec is not None:
@@ -1457,7 +1478,7 @@ async def send_focus_view(bot, message, chat, rec: dict):
     burying the chat.
     """
     pane_id = rec["pane_id"]
-    header = f"🎯 {agent_identity(rec)} · 已聚焦"
+    header = f"🎯 {pane_focus_identity(rec)} · 已聚焦"
     content, _is_raw = await read_agent(pane_id)
     return await show_pane_view(
         bot, chat.id, message, pane_id, header, content,

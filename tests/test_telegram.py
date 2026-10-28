@@ -1554,6 +1554,30 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.active_pane, "wT:pA")
         self.assertIn("当前对话", message.replies[0][0])
 
+    # --- pf.7: pane-anchored preview header ------------------------------
+
+    def test_focus_identity_anchors_on_pane_title_not_project(self):
+        rec = _rec("wT:pA", label="hpc-lagrange-system", status="working",
+                   project="lagrange-system", cwd="/repo/lagrange-system",
+                   title="DeepSeek v4.1 投机推理部署", agent="claude")
+        ident = tg.pane_focus_identity(rec)
+        # Title carries the topic, pane id the stable key, coord the runtime;
+        # the slug is not spelled out twice.
+        self.assertEqual(ident, "DeepSeek v4.1 投机推理部署 (wT:pA) · coord")
+        self.assertNotIn("hpc-", ident)
+
+    def test_focus_identity_without_title_falls_back_to_project(self):
+        rec = _rec("wT:pA", label="", status="idle", project="nix-hm",
+                   cwd="/repo/nix-hm", title="", agent="claude")
+        self.assertEqual(tg.pane_focus_identity(rec), "nix-hm (wT:pA) · claude")
+
+    def test_focus_identity_keeps_coord_index_and_harness(self):
+        rec = _rec("wT:p3K", label="hpc-lagrange-system-3", status="idle",
+                   project="lagrange-system", cwd="/repo/lagrange-system",
+                   title="Qwen3.8-27B BF16 C4 评测交接", agent="claude")
+        self.assertEqual(tg.pane_focus_identity(rec),
+                         "Qwen3.8-27B BF16 C4 评测交接 (wT:p3K) · coord-3")
+
     # --- /switch selector --------------------------------------------------
 
     async def test_switch_selection_focuses_shows_preview_and_routes_followup(self):
@@ -1573,8 +1597,13 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg.active_pane, "wT:pA")
         self.assertEqual(tg.recent_panes[0], "wT:pA")
         # pf.6: the selection posts the focus header WITH the transcript preview.
-        self.assertIn("已聚焦", callback.message.replies[0][0])
-        self.assertIn("最新进展", callback.message.replies[0][0])
+        # pf.7: the header is pane-anchored (title + pane id), the raw hpc- slug
+        # never appears.
+        text0 = callback.message.replies[0][0]
+        self.assertIn("已聚焦", text0)
+        self.assertIn("最新进展", text0)
+        self.assertIn("(wT:pA)", text0)
+        self.assertNotIn("hpc-lagrange", text0)
 
         follow = FakeMessage()
         follow.text = "do the thing"
