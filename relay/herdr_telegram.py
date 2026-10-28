@@ -10,6 +10,8 @@ import unicodedata
 from collections import Counter, OrderedDict
 
 from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
     ForceReply,
     Update,
     InlineKeyboardButton,
@@ -95,8 +97,24 @@ BAR_MIN_INTERVAL = 1.0            # fastest cadence of silent bar refreshes
 # is deleted immediately anyway.
 BAR_PLACEHOLDER = "\u2060"
 BAR_SWITCH_LABEL = "📋 切换 session"
+BAR_PENDING_LABEL = "🚫 待办"
+BAR_PROJECT_LABEL = "📁 项目"
 BAR_DASHBOARD_LABEL = "📊 Dashboard"
 BAR_UNFOCUS_LABEL = "✖ 取消聚焦"
+
+# pf.10: the typing-"/" menu is scoped to the one authorized private chat and
+# described in Chinese to match the bar and the pickers.
+COMMAND_MENU = (
+    ("switch", "选择 session 并聚焦"),
+    ("dashboard", "看板"),
+    ("agents", "全部 session"),
+    ("read", "查看对话"),
+    ("trust", "批准并永久信任"),
+    ("interrupt", "中断"),
+    ("unfocus", "取消聚焦"),
+    ("status", "连接状态"),
+    ("digest", "今日统计"),
+)
 PENDING_LIMIT = 500
 COMMAND_ACK_TIMEOUT = 20
 PANE_READ_TIMEOUT = 20
@@ -1189,6 +1207,10 @@ def build_bar_markup() -> ReplyKeyboardMarkup | None:
         rows.append(["🎯 " + active_item[0]])
     for label, _rec in recent_items:
         rows.append(["🔄 " + label])
+    # pf.10: the two drill-down shortcuts are static: 🚫 待办 jumps straight to
+    # the blocked picker, 📁 项目 to the project list. Their own row keeps them
+    # present even with no active pane and off the crowded three-key row.
+    rows.append([BAR_PENDING_LABEL, BAR_PROJECT_LABEL])
     last = [BAR_SWITCH_LABEL, BAR_DASHBOARD_LABEL]
     if active_item is not None:
         last.append(BAR_UNFOCUS_LABEL)
@@ -1270,6 +1292,10 @@ def bar_label_pane(text: str) -> tuple[str, str | None]:
     recent_map = {"🔄 " + label: rec.get("pane_id") for label, rec in recent_items}
     if text == BAR_SWITCH_LABEL:
         return "switch", None
+    if text == BAR_PENDING_LABEL:
+        return "pending", None
+    if text == BAR_PROJECT_LABEL:
+        return "project", None
     if text == BAR_DASHBOARD_LABEL:
         return "dashboard", None
     if text == BAR_UNFOCUS_LABEL:
@@ -1480,6 +1506,124 @@ async def send_focus_view(bot, message, chat, rec: dict):
     )
 
 
+# --- Project drill-down (pf.10) ---------------------------------------------
+#
+# A sibling picker to /switch: first choose a PROJECT (the herd here spans
+# lagrange-system, learning, road-42, ...), then one of that project's human
+# sessions. Projects are identified on the wire by their slug, re-resolved
+# from the live snapshot at tap time exactly like pane tokens, so a stale slug
+# answers "project no longer present" and offers the fresh list instead of
+# acting on the wrong conversation. Counts cover human panes only -- thread
+# workers never reach any number here.
+PROJECT_PAGE_SIZE = SWITCH_PAGE_SIZE
+
+
+def _project_rows() -> list[tuple[str, dict]]:
+    """Projects with >=1 human pane: (slug, {blocked, working, panes}).
+
+    Ordered blocked-count desc, then project name; the panes inside each
+    project keep sorted_agents' status ranking so the neediest is first.
+    """
+    by_project: dict[str, dict] = {}
+    for rec in sorted_agents(human_agents()):
+        slug = effective_project(rec)
+        row = by_project.setdefault(slug, {"blocked": 0, "working": 0, "panes": []})
+        row["panes"].append(rec)
+        if rec.get("status") == "blocked":
+            row["blocked"] += 1
+        elif rec.get("status") == "working":
+            row["working"] += 1
+    ordered = sorted(by_project.items(), key=lambda kv: (-kv[1]["blocked"], kv[0].lower()))
+    return [(slug, row) for slug, row in ordered]
+
+
+def _project_button_label(slug: str, row: dict) -> str:
+    """`📁 <project> · 🚫n ▶️n`, zero counts omitted, capped to one button line."""
+    counts = []
+    if row["blocked"]:
+        counts.append(f"🚫{row['blocked']}")
+    if row["working"]:
+        counts.append(f"▶️{row['working']}")
+    label = "📁 " + slug
+    if counts:
+        label += " · " + " ".join(counts)
+    return _cell_truncate(label, SWITCH_LABEL_CELLS)
+
+
+# The callback must fit in 64 bytes: {"action":"proj-open","s":"<slug>"}
+# leaves ~44 bytes for the slug. Real project slugs are short; a longer one is
+# sent as a hash token and re-resolved from the live snapshot at tap time,
+# exactly like pane tokens.
+def _project_cb(slug: str, action: str, **extra) -> str:
+    direct = _switch_cb(action=action, s=slug, **extra)
+    if len(direct.encode()) <= 64:
+        return direct
+    token = hashlib.sha1(slug.encode()).hexdigest()[:12]
+    return _switch_cb(action=action, pt=token, **extra)
+
+
+def _resolve_project_key(data: dict) -> str | None:
+    """Map a tap-time project key (slug or hash token) back to a live slug."""
+    rows = _project_rows()
+    slug = data.get("s")
+    if isinstance(slug, str) and any(project == slug for project, _r in rows):
+        return slug
+    token = data.get("pt")
+    if isinstance(token, str):
+        for project, _r in rows:
+            if hashlib.sha1(project.encode()).hexdigest()[:12] == token:
+                return project
+    return None
+
+
+def build_project_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(
+            _project_button_label(slug, row),
+            callback_data=_project_cb(slug, "proj-open"),
+        )]
+        for slug, row in _project_rows()
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
+def _find_project(slug: str) -> dict | None:
+    return next((row for project, row in _project_rows() if project == slug), None)
+
+
+def build_project_sessions_keyboard(slug: str, page: int = 0) -> InlineKeyboardMarkup | None:
+    """Second level: the project's human sessions in the /switch two-line style."""
+    row = _find_project(slug)
+    if row is None:
+        return None
+    panes = row["panes"]
+    page_count = max(1, (len(panes) + PROJECT_PAGE_SIZE - 1) // PROJECT_PAGE_SIZE)
+    page = min(max(page, 0), page_count - 1)
+    visible = panes[page * PROJECT_PAGE_SIZE:(page + 1) * PROJECT_PAGE_SIZE]
+    keyboard = [
+        [InlineKeyboardButton(
+            _switch_pane_label(rec),
+            callback_data=pane_callback_data("switch", rec["pane_id"]),
+        )]
+        for rec in visible
+    ]
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "Previous", callback_data=_project_cb(slug, "proj-page", page=page - 1),
+        ))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton(
+            "Next", callback_data=_project_cb(slug, "proj-page", page=page + 1),
+        ))
+    if nav:
+        keyboard.append(nav)
+    keyboard.append([InlineKeyboardButton(
+        "‹ 返回项目列表", callback_data=_switch_cb(action="proj-list")
+    )])
+    return InlineKeyboardMarkup(keyboard)
+
+
 def receipt_keyboard(pane_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("📖 Read", callback_data=pane_callback_data("read", pane_id)),
@@ -1642,6 +1786,24 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _reply_projects(message, caption: str):
+    """Post (or re-post) the project list, or say there is nothing to list."""
+    if not relay_connected and not human_agents():
+        await message.reply_text("Relay disconnected. Use /switch after it reconnects.")
+        return
+    if not _project_rows():
+        await message.reply_text("没有人类 session 在线（thread worker 已隐藏）。")
+        return
+    await message.reply_text(caption, reply_markup=build_project_keyboard())
+
+
+async def cmd_project(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle the 📁 项目 bar key — pick a project, then a session in it."""
+    if not authorized(update):
+        return
+    await _reply_projects(update.message, "选择项目：")
+
+
 async def cmd_find(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Handle /find <keyword> — /switch with a text filter."""
     if not authorized(update):
@@ -1666,37 +1828,98 @@ async def cmd_unfocus(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("已取消聚焦，之后的消息不会发送，直到你重新 /switch。")
 
 
-async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /agents — list current human-facing agents with full identity."""
-    panes = human_agents()
-    if not panes:
-        await update.message.reply_text(
-            "No human sessions connected (thread workers are hidden)."
-            if relay_connected else "Not connected to relay."
-        )
-        return
+# A /agents page must leave room for its "(page x/y)" caption and the pager
+# row under Telegram's 4096 utf-16 cap; identities are themselves uncapped, so
+# an over-long single line is truncated here rather than failing the send.
+AGENTS_PAGE_U16 = 3800
+# A single identity line is truncated with room for a re-emitted section
+# header and newline on a page that starts mid-section.
+AGENTS_PAGE_LINE_U16 = AGENTS_PAGE_U16 - 24
+_AGENT_SECTIONS = (
+    ("BLOCKED:", lambda a: a.get("status") == "blocked"),
+    ("WORKING:", lambda a: a.get("status") == "working"),
+    ("DONE:", lambda a: a.get("status") == "done"),
+    ("IDLE:", lambda a: a.get("status") in ("idle", "unknown")),
+)
 
-    sections = [
-        ("BLOCKED:", lambda a: a.get("status") == "blocked"),
-        ("WORKING:", lambda a: a.get("status") == "working"),
-        ("DONE:", lambda a: a.get("status") == "done"),
-        ("IDLE:", lambda a: a.get("status") in ("idle", "unknown")),
-    ]
-    lines = []
-    for header, pred in sections:
+
+def agents_pages() -> list[str]:
+    """All human panes as sectioned text pages bounded to one Telegram message.
+
+    One message used to truncate at 4096 chars, hiding every pane past the
+    cut; pages keep every pane reachable through the inline pager.
+    """
+    panes = human_agents()
+    pages: list[str] = []
+    current: list[str] = []
+    used = 0
+
+    def push(line: str):
+        nonlocal used
+        current.append(line)
+        used += _u16len(line) + 1
+
+    for header, pred in _AGENT_SECTIONS:
         rows = sorted(
             (a for a in panes if pred(a)),
             key=lambda a: (effective_project(a).lower(), pane_descriptor(a).lower()),
         )
         if not rows:
             continue
-        lines.append(header)
-        for a in rows:
-            lines.append(f"  {agent_identity(a)}")
-    text = "\n".join(lines)
-    if _u16len(text) > TG_MSG_MAX:
-        text = text[: TG_MSG_MAX - 40].rstrip() + "\n… (truncated — use /read <project>)"
-    await update.message.reply_text(text)
+        body = [
+            f"  {_html_escape(_u16_truncate(agent_identity(a), AGENTS_PAGE_LINE_U16))}"
+            for a in rows
+        ]
+        for line in [header, *body]:
+            cost = _u16len(line) + 1
+            if current and used + cost > AGENTS_PAGE_U16:
+                pages.append("\n".join(current))
+                current, used = [], 0
+                # Re-emit the header on the new page so its rows are never
+                # attached to the previous section.
+                if line != header:
+                    push(header)
+            push(line)
+    if current:
+        pages.append("\n".join(current))
+    return pages
+
+
+def agents_page_text(page: int, pages: list[str]) -> str:
+    if len(pages) > 1:
+        return f"{pages[page]}\n\n<i>第 {page + 1}/{len(pages)} 页</i>"
+    return pages[page]
+
+
+def build_agents_pager(page: int, page_count: int) -> InlineKeyboardMarkup | None:
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(
+            "Previous",
+            callback_data=_switch_cb(action="agents-page", page=page - 1),
+        ))
+    if page + 1 < page_count:
+        nav.append(InlineKeyboardButton(
+            "Next",
+            callback_data=_switch_cb(action="agents-page", page=page + 1),
+        ))
+    return InlineKeyboardMarkup([nav]) if nav else None
+
+
+async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle /agents — list current human-facing agents with full identity."""
+    pages = agents_pages()
+    if not pages:
+        await update.message.reply_text(
+            "No human sessions connected (thread workers are hidden)."
+            if relay_connected else "Not connected to relay."
+        )
+        return
+    await update.message.reply_text(
+        agents_page_text(0, pages),
+        parse_mode="HTML",
+        reply_markup=build_agents_pager(0, len(pages)),
+    )
 
 
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1968,6 +2191,57 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if action == "agents-page":
+        pages = agents_pages()
+        if not pages:
+            await query.message.reply_text(
+                "No human sessions connected (thread workers are hidden)."
+            )
+            return
+        try:
+            wanted = int(data.get("page", 0))
+        except (TypeError, ValueError):
+            wanted = 0
+        page = min(max(wanted, 0), len(pages) - 1)
+        await query.edit_message_text(
+            text=agents_page_text(page, pages),
+            parse_mode="HTML",
+            reply_markup=build_agents_pager(page, len(pages)),
+        )
+        return
+
+    if action == "proj-list":
+        try:
+            await query.edit_message_reply_markup(reply_markup=build_project_keyboard())
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+        return
+
+    if action in ("proj-open", "proj-page"):
+        slug = _resolve_project_key(data)
+        page = 0
+        if action == "proj-page":
+            try:
+                page = int(data.get("page", 0))
+            except (TypeError, ValueError):
+                page = 0
+        if slug is None:
+            # Stale slug/token: the project vanished since the list was drawn.
+            # Re-resolve from the live snapshot and offer the fresh list.
+            await _reply_projects(query.message, "该项目已不在当前列表中，重新选择：")
+            return
+        markup = build_project_sessions_keyboard(slug, page=page)
+        if markup is None:
+            await _reply_projects(query.message, "该项目已不在当前列表中，重新选择：")
+            return
+        try:
+            await query.edit_message_reply_markup(reply_markup=markup)
+        except Exception as e:
+            if "not modified" not in str(e).lower():
+                raise
+        return
+
     if action == "switch":
         pane_id = data.get("pane_id")
         selected = next(
@@ -2201,6 +2475,23 @@ async def handle_bar_tap(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     message = update.message
     if kind == "switch":
         await cmd_switch(update, ctx)
+        return
+    if kind == "pending":
+        # Portal's 待办 shortcut: the /switch picker locked to blocked panes;
+        # picking a row goes through the same focus + transcript preview.
+        if not relay_connected and not human_agents():
+            await message.reply_text("Relay disconnected. Use /switch after it reconnects.")
+            return
+        blocked = _switch_panes("blocked", "")
+        if not blocked:
+            await message.reply_text("当前没有待办。")
+            return
+        await message.reply_text(
+            "待办 session，可切换过滤：", reply_markup=build_switch_keyboard(statusf="blocked")
+        )
+        return
+    if kind == "project":
+        await cmd_project(update, ctx)
         return
     if kind == "dashboard":
         await cmd_dashboard(update, ctx)
@@ -2604,8 +2895,26 @@ async def relay_listener(app: Application):
 
 # --- Main ---
 
+async def post_init(app: Application):
+    """Register the typing-"/" command menu, scoped to the authorized chat.
+
+    A failure here (network, unsupported scope) must never stop the bot from
+    starting: the menu is a hint, not a requirement.
+    """
+    if not CHAT_ID:
+        return
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(command=cmd, description=desc) for cmd, desc in COMMAND_MENU],
+            scope=BotCommandScopeChat(chat_id=int(CHAT_ID)),
+        )
+        log.info("command menu registered for chat %s", CHAT_ID)
+    except Exception as e:
+        log.warning("failed to register command menu: %s", scrub(e))
+
+
 def main():
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
     if CHAT_ID:
         auth_filter = filters.Chat(chat_id=int(CHAT_ID))
     else:
@@ -2634,6 +2943,10 @@ def main():
         load_state()
         async with app:
             await app.start()
+            # The manual lifecycle (app.start + updater.start_polling) does NOT
+            # run the builder's post_init -- only run_polling/run_webhook do --
+            # so the command menu must be registered explicitly here.
+            await post_init(app)
             await app.updater.start_polling()
             dashboard_task = asyncio.create_task(dashboard_loop(app))
             try:

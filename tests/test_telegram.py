@@ -1327,7 +1327,13 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         self._herd()
         markup = tg.build_bar_markup()
         flat = self._bar_texts(markup)
-        self.assertEqual(flat, [tg.BAR_SWITCH_LABEL, tg.BAR_DASHBOARD_LABEL])
+        # pf.10: two static rows — 🚫 待办 / 📁 项目, then 📋 / 📊; ✖ unfocus
+        # only exists with an active pane.
+        self.assertEqual(
+            flat,
+            [tg.BAR_PENDING_LABEL, tg.BAR_PROJECT_LABEL,
+             tg.BAR_SWITCH_LABEL, tg.BAR_DASHBOARD_LABEL],
+        )
         self.assertIn("先选", markup.input_field_placeholder)
 
     def test_bar_active_and_recents_hide_workers_and_dead_panes(self):
