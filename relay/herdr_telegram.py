@@ -6,6 +6,7 @@
 """herdr-remote Telegram bot — monitor and approve agents from Telegram."""
 import asyncio, hashlib, json, os, logging, secrets, time
 import re
+import unicodedata
 from collections import Counter, OrderedDict
 
 from telegram import (
@@ -241,6 +242,43 @@ _HISTORY_ROLE_LABELS = {"user": "you", "assistant": "agent", "note": "note"}
 
 def _u16len(s: str) -> int:
     return len(s.encode("utf-16-le")) // 2
+
+
+# Display cells, not code units: CJK and emoji draw two cells wide on the
+# phone, which is what actually clips an inline button. u16 budgets let
+# CJK-heavy titles render at double the button width.
+def _cell_len(s: str) -> int:
+    width = 0
+    for ch in s:
+        if unicodedata.combining(ch) or ch == "\ufe0f":
+            continue
+        if ord(ch) >= 0x1F000 or ch == "\u25b6" or unicodedata.east_asian_width(ch) in ("W", "F"):
+            width += 2
+        else:
+            width += 1
+    return width
+
+
+def _cell_truncate(s: str, budget: int) -> str:
+    """Truncate by display cells; the trailing ellipsis counts in budget."""
+    if budget <= 0:
+        return ""
+    if _cell_len(s) <= budget:
+        return s
+    out: list[str] = []
+    used = 0  # content cells; one more cell is reserved for the ellipsis
+    for ch in s:
+        if unicodedata.combining(ch) or ch == "\ufe0f":
+            step = 0
+        elif ord(ch) >= 0x1F000 or ch == "\u25b6" or unicodedata.east_asian_width(ch) in ("W", "F"):
+            step = 2
+        else:
+            step = 1
+        if used + step > budget - 1:
+            break
+        out.append(ch)
+        used += step
+    return "".join(out).rstrip() + "\u2026"
 
 
 def _html_escape(s: str) -> str:
@@ -1222,15 +1260,23 @@ def bar_label_pane(text: str) -> tuple[str, str | None]:
 # a phone), hpc-<own project> coordinator names collapse to "coord" so the row
 # is not twice the same slug, and the four status chips stay short enough for
 # one phone-width row.
+# pf.5: budgets are display *cells* (CJK/emoji = 2), measured against an iPhone
+# inline button (~40 half-width cells) -- u16 budgets let CJK titles render at
+# double the button width. Only the first pane of each project on a page keeps
+# the project tag; continuation rows spend the width on the title instead.
+# Title gets a reserved minimum and the project shrinks first; pane id and
+# session are the tail that is never cut.
 
 SWITCH_PAGE_SIZE = 10             # pane rows per /switch page
-SWITCH_LABEL_LIMIT = 80           # u16 units for a full-width phone button
-SWITCH_PROJECT_LIMIT = 16
-SWITCH_SESSION_LIMIT = 18
-SWITCH_HOST_LIMIT = 16
+SWITCH_LABEL_CELLS = 40           # half-width cells of a phone inline button
+SWITCH_PROJECT_MIN_CELLS = 6      # project keeps at least that when title exists
+SWITCH_TITLE_MIN_CELLS = 12       # title is reserved that much before project
+SWITCH_SESSION_CELLS = 18
+SWITCH_HOST_CELLS = 10
 SWITCH_FILTERS = ("all", "blocked", "working", "idle")
-SWITCH_FILTER_LABELS = {"all": "全部", "blocked": "🚫 待处理",
-                        "working": "▶️ 运行", "idle": "💤 空闲"}
+# Two CJK chars each: glyph + 3-char words still clip to "O…理" on a phone.
+SWITCH_FILTER_LABELS = {"all": "全部", "blocked": "待办",
+                        "working": "运行", "idle": "空闲"}
 
 _HPC_COORD_SUFFIX_RE = re.compile(r"^(.+)-(\d+)$")
 
@@ -1261,8 +1307,10 @@ def _switch_panes(statusf: str, query: str) -> list[dict]:
     """Matching human panes, grouped by effective project.
 
     Iteration follows the status ranking (so the first group holds the most
-    urgent panes) and panes stay grouped within each project — without header
-    rows, the project tag is part of every pane label.
+    urgent panes) and panes stay grouped within each project. Only the first
+    pane of a group on each page keeps the project tag (see
+    build_switch_keyboard): a phone inline button fits ~40 display cells and
+    the 15-cell slug cannot be repeated on every row.
     """
     groups: "OrderedDict[str, list[dict]]" = OrderedDict()
     for rec in sorted_agents(human_agents()):
@@ -1291,31 +1339,54 @@ def _short_session(rec: dict, project: str) -> str:
     return session
 
 
-def _switch_pane_label(rec: dict) -> str:
-    """glyph project › title (pane) · session @host with component-aware cut.
+def _switch_pane_label(rec: dict, show_project: bool = True) -> str:
+    """glyph [project›]title (pane)·session@host, budgeted in display cells.
 
-    Phone clients truncate a button by pixels regardless of our char cap, so
-    the free-form title is the only component we ever shorten: project,
-    session and host are pre-capped and the pane id is always intact — every
-    row stays resolvable to an exact pane.
+    Layout (no spaces around ›/·):
+      tagged row:  glyph project›title (pane)·session @host
+      continuation: glyph title (pane)·session @host
+    The free-form title gets a reserved minimum on tagged rows; the project
+    is the first component cut. Pane id and session form a tail that is never
+    shortened by the title budget (session itself caps at
+    SWITCH_SESSION_CELLS), so any row resolves to exactly one pane.
     """
     project = effective_project(rec)
     glyph = STATUS_GLYPH.get(rec.get("status", "unknown"), "💤")
-    head = f"{glyph} {_u16_truncate(project, SWITCH_PROJECT_LIMIT)} › "
-    session = _u16_truncate(_short_session(rec, project), SWITCH_SESSION_LIMIT)
+    session = _cell_truncate(_short_session(rec, project), SWITCH_SESSION_CELLS)
     host = rec.get("host") or "local"
     host_part = (
-        f" @{_u16_truncate(host, SWITCH_HOST_LIMIT)}" if host != "local" else ""
+        f"@{_cell_truncate(host, SWITCH_HOST_CELLS)}" if host != "local" else ""
     )
     pane_id = str(rec.get("pane_id") or "?")
     title = (rec.get("title") or "").strip()
-    tail = f"({pane_id}) · {session}{host_part}"
-    room = SWITCH_LABEL_LIMIT - _u16len(head) - _u16len(tail) - 1  # space
-    if title and room >= 6:
-        desc = f"{_u16_truncate(title, room)} ({pane_id})"
-    else:
-        desc = pane_id
-    return f"{head}{desc} · {session}{host_part}"
+    prefix = f"{glyph} "
+    tail = f"({pane_id})·{session}{host_part}"
+    room = SWITCH_LABEL_CELLS - _cell_len(prefix) - _cell_len(tail) - 1  # space
+
+    if not show_project:
+        if title and room >= 6:
+            return f"{prefix}{_cell_truncate(title, room)} {tail}"
+        return f"{prefix}{tail}"
+
+    if not title:
+        return f"{prefix}{_cell_truncate(project, max(room, 0))} {tail}"
+
+    pc = _cell_len(project)
+    if pc + 1 + _cell_len(title) <= room:
+        return f"{prefix}{project}›{title} {tail}"
+
+    # Both do not fit: title first, project absorbs the remainder (min 6).
+    title_budget = min(_cell_len(title), max(SWITCH_TITLE_MIN_CELLS, room - 1 - SWITCH_PROJECT_MIN_CELLS))
+    proj_budget = room - 1 - title_budget
+    if proj_budget < 4:
+        # Even a minimal project leaves no usable title: skip the title.
+        return f"{prefix}{_cell_truncate(project, max(room, 0))} {tail}"
+    if title_budget < 4:
+        return f"{prefix}{_cell_truncate(project, max(room, 0))} {tail}"
+    return (
+        f"{prefix}{_cell_truncate(project, proj_budget)}›"
+        f"{_cell_truncate(title, title_budget)} {tail}"
+    )
 
 
 def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") -> InlineKeyboardMarkup:
@@ -1327,10 +1398,18 @@ def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") 
     page = min(max(page, 0), page_count - 1)
     visible = panes[page * SWITCH_PAGE_SIZE:(page + 1) * SWITCH_PAGE_SIZE]
 
-    keyboard = [[InlineKeyboardButton(
-        _switch_pane_label(rec),
-        callback_data=pane_callback_data("switch", rec["pane_id"]),
-    )] for rec in visible]
+    # Tag the first pane of each project on THIS page; continuation rows spend
+    # the cells on the title. A group straddling a page break is re-tagged.
+    keyboard = []
+    tagged_on_page: set[str] = set()
+    for rec in visible:
+        project = effective_project(rec)
+        show_project = project not in tagged_on_page
+        tagged_on_page.add(project)
+        keyboard.append([InlineKeyboardButton(
+            _switch_pane_label(rec, show_project=show_project),
+            callback_data=pane_callback_data("switch", rec["pane_id"]),
+        )])
 
     keyboard.append([
         InlineKeyboardButton(

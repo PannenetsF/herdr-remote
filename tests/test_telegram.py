@@ -1604,7 +1604,7 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         nav = next(b for b in self._flatten(first) if b.text == "Next")
         self.assertEqual(json.loads(nav.callback_data)["page"], 1)
 
-    # --- pf.4: project-tagged rows, coord collapse, short filter chips -----
+    # --- pf.4/pf.5: project-tagged rows, coord collapse, cell-width budget -
 
     def _switch_rows(self, markup):
         return [b for b in self._flatten(markup)
@@ -1622,12 +1622,16 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
             tg.parse_callback_data(b.callback_data)["pane_id"]: b.text
             for b in self._switch_rows(tg.build_switch_keyboard())
         }
-        self.assertTrue(labels["w:1"].endswith("· coord"))
-        self.assertIn("· coord-2", labels["w:2"])
+        self.assertTrue(labels["w:1"].endswith("·coord"))
+        self.assertIn("·coord-2", labels["w:2"])
         self.assertIn("hpc-other-project", labels["w:3"])
-        # every row still starts glyph + the row's project tag
-        for text in labels.values():
-            self.assertIn("lagrange-system › ", text)
+        # only the first pane of the project on the page carries the tag;
+        # project and title share the tagged row so the slug truncates first
+        tagged = [t for t in labels.values() if "›" in t]
+        self.assertEqual(len(tagged), 1)
+        self.assertTrue(tagged[0].startswith("▶️ lagra…›"))
+        for pid in ("w:2", "w:3"):
+            self.assertNotIn("lagrange", labels[pid].split(" (")[0])
 
     def test_short_session_handles_namesrs_truncated_names(self):
         long_slug = "a-very-long-project-slug-indeed"  # 29 chars
@@ -1636,25 +1640,64 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(tg._short_session(r1, long_slug), "coord")
         self.assertEqual(tg._short_session(r2, long_slug), "coord-2")
 
-    def test_long_title_is_the_only_component_cut(self):
-        title = "x" * 200
-        rec = _rec("wT:pZZ", label="hpc-nix-hm", status="working",
-                   project="nix-hm", cwd="/u/nix-hm", title=title, host="boe-fyq")
-        label = tg._switch_pane_label(rec)
-        self.assertTrue(label.endswith("(wT:pZZ) · coord @boe-fyq"))
-        self.assertTrue(label.startswith("▶️ nix-hm › "))
-        self.assertLessEqual(tg._u16len(label), tg.SWITCH_LABEL_LIMIT)
+    def test_every_row_fits_the_button_cell_budget_and_keeps_tail(self):
+        cases = [
+            _rec("wT:pZZ", label="hpc-nix-hm", status="working",
+                 project="nix-hm", cwd="/u/nix-hm", title="x" * 200),
+            _rec("w:1", label="hpc-lagrange-system", status="blocked",
+                 project="lagrange-system", cwd="/u/lagrange-system",
+                 title="byted_vllm 性能测试方案", host="boe-fyq"),
+            _rec("w:2", label="", status="idle", project="lagrange-system",
+                 cwd="/u/lagrange-system", title="短标题"),
+        ]
+        for rec in cases:
+            for show in (True, False):
+                label = tg._switch_pane_label(rec, show_project=show)
+                self.assertLessEqual(
+                    tg._cell_len(label), tg.SWITCH_LABEL_CELLS, label
+                )
+                # pane id and session tail are never destroyed
+                self.assertIn(f"({rec['pane_id']})·", label)
 
-    def test_filter_chips_are_short_and_one_row(self):
+    def test_continuation_row_spends_cells_on_the_cjk_title(self):
+        rec = _rec("w:1", label="hpc-lagrange-system", status="working",
+                   project="lagrange-system", cwd="/u/lagrange-system",
+                   title="byted_vllm 性能测试方案")
+        tagged = tg._switch_pane_label(rec, True)
+        cont = tg._switch_pane_label(rec, False)
+        self.assertIn("›", tagged)
+        self.assertNotIn("lagrange", cont)
+        # the continuation keeps the latin head and two CJK glyphs the tagged
+        # row cannot afford
+        self.assertIn("byted_vllm", cont)
+        self.assertIn("性能", cont)
+        self.assertGreater(
+            tg._cell_len(cont.split(" (")[0]),
+            tg._cell_len(tagged.split("›")[1].split(" (")[0]),
+        )
+
+    def test_project_is_retagged_on_every_page(self):
+        tg.agents = [
+            coord_rec(f"w:p{i:02d}", "same-project",
+                      status=("blocked" if i % 3 == 0 else "working"))
+            for i in range(tg.SWITCH_PAGE_SIZE + 2)
+        ]
+        first = [b.text for b in self._switch_rows(tg.build_switch_keyboard(page=0))]
+        second = [b.text for b in self._switch_rows(tg.build_switch_keyboard(page=1))]
+        self.assertEqual(sum("›" in t for t in first), 1)
+        self.assertEqual(sum("›" in t for t in second), 1)
+
+    def test_filter_chips_are_two_cjk_chars_and_one_row(self):
         self._herd()
         markup = tg.build_switch_keyboard(statusf="blocked")
         chip_rows = [row for row in markup.inline_keyboard
-                     if all("action" in tg.parse_callback_data(b.callback_data)
-                            and tg.parse_callback_data(b.callback_data).get("action") == "switch-filter"
+                     if all(tg.parse_callback_data(b.callback_data).get("action") == "switch-filter"
                             for b in row)]
         self.assertEqual(len(chip_rows), 1)
         self.assertEqual([b.text for b in chip_rows[0]],
-                         ["○ 全部", "● 🚫 待处理", "○ ▶️ 运行", "○ 💤 空闲"])
+                         ["○ 全部", "● 待办", "○ 运行", "○ 空闲"])
+        for b in chip_rows[0]:
+            self.assertLessEqual(tg._cell_len(b.text), 8)
 
     def test_remote_host_is_visible_on_row(self):
         rec = coord_rec("w:1", "lagrange", host="boe-fyq")
