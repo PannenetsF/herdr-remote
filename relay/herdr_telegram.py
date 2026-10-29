@@ -106,6 +106,7 @@ BAR_UNFOCUS_LABEL = "✖ 取消聚焦"
 # described in Chinese to match the bar and the pickers.
 COMMAND_MENU = (
     ("switch", "选择 session 并聚焦"),
+    ("project", "按项目浏览 session"),
     ("dashboard", "看板"),
     ("agents", "全部 session"),
     ("read", "查看对话"),
@@ -2944,6 +2945,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start, filters=auth_filter))
     app.add_handler(CommandHandler("dashboard", cmd_dashboard, filters=auth_filter))
     app.add_handler(CommandHandler("switch", cmd_switch, filters=auth_filter))
+    app.add_handler(CommandHandler("project", cmd_project, filters=auth_filter))
     app.add_handler(CommandHandler("find", cmd_find, filters=auth_filter))
     app.add_handler(CommandHandler("unfocus", cmd_unfocus, filters=auth_filter))
     app.add_handler(CommandHandler("agents", cmd_agents, filters=auth_filter))

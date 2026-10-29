@@ -170,7 +170,7 @@ def _flat(markup):
 
 
 class CommandMenuTests(unittest.IsolatedAsyncioTestCase):
-    REQUIRED = ("switch", "dashboard", "agents", "read", "trust",
+    REQUIRED = ("switch", "project", "dashboard", "agents", "read", "trust",
                 "interrupt", "unfocus", "status", "digest")
 
     async def test_post_init_registers_scoped_chinese_menu(self):
@@ -393,6 +393,17 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
 
     def test_unknown_slug_has_no_keyboard(self):
         self.assertIsNone(self.tg.build_project_sessions_keyboard("ghost"))
+
+    async def test_project_command_posts_the_same_project_list(self):
+        tg = self.tg
+        message = _FakeMessage()
+        await tg.cmd_project(_update(message=message), types.SimpleNamespace())
+        self.assertEqual(len(message.replies), 1)
+        text, kwargs, _sent = message.replies[0]
+        self.assertIn("项目", text)
+        labels = [b.text for b in _flat(kwargs["reply_markup"])]
+        self.assertEqual(len(labels), 3)
+        self.assertTrue(labels[0].startswith("📁 zebra"))
 
     def test_pagination_for_many_sessions(self):
         tg = self.tg

@@ -51,10 +51,12 @@ echo "5. telegram demo bot syntax"
 assert_eq "$?" "0" "herdr_telegram_demo.py parses"
 
 echo "6. telegram bot has all commands"
-for cmd in cmd_start cmd_agents cmd_status cmd_read cmd_send cmd_reply cmd_trust cmd_interrupt; do
+for cmd in cmd_start cmd_agents cmd_status cmd_read cmd_send cmd_reply cmd_trust cmd_interrupt cmd_project; do
   grep -q "async def $cmd" "$DIR/relay/herdr_telegram.py" || { FAIL=$((FAIL+1)); echo "  FAIL: missing $cmd"; continue; }
 done
-PASS=$((PASS+1)); echo "  pass: all 8 commands present"
+grep -q 'CommandHandler("project", cmd_project' "$DIR/relay/herdr_telegram.py" \
+  || { FAIL=$((FAIL+1)); echo "  FAIL: /project command not registered"; }
+PASS=$((PASS+1)); echo "  pass: all 9 commands present"
 
 echo "7. telegram bot env vars documented"
 grep -q "HERDR_TG_TOKEN" "$DIR/relay/herdr_telegram.py" && grep -q "HERDR_TG_CHAT_ID" "$DIR/relay/herdr_telegram.py"
