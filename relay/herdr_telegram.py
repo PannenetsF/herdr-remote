@@ -657,9 +657,21 @@ def pane_descriptor(rec: dict) -> str:
     return f"{title} ({pane_id})" if title else str(pane_id)
 
 
+def _host_suffix(rec: dict) -> str:
+    """` @host` for a remote pane, "" locally -- the one machine marker every
+    cross-machine identity string must carry (pf.16), since the same project
+    slug and even the same pane id can exist on two machines."""
+    host = rec.get("host") or "local"
+    return f" @{host}" if host != "local" else ""
+
+
 def agent_identity(rec: dict) -> str:
     session = (rec.get("label") or "").strip() or rec.get("agent") or "agent"
-    return " > ".join((effective_project(rec), pane_descriptor(rec), session))
+    return " > ".join((
+        effective_project(rec) + _host_suffix(rec),
+        pane_descriptor(rec),
+        session,
+    ))
 
 
 def pane_focus_identity(rec: dict) -> str:
@@ -680,7 +692,7 @@ def pane_focus_identity(rec: dict) -> str:
     title = (rec.get("title") or "").strip()
     head = title or project
     session = _short_session(rec, project)
-    return f"{head} ({pane_id}) · {session}"
+    return f"{head} ({pane_id}) · {session}{_host_suffix(rec)}"
 
 
 def identity_for_blocked(msg: dict) -> str:
@@ -899,16 +911,16 @@ def _pane_line_label(rec: dict) -> str:
     return _u16_truncate(f"{pane_descriptor(rec)} · {session}{suffix}", 150)
 
 
-def _dashboard_groups(now: float) -> "OrderedDict[str, dict]":
-    groups: "OrderedDict[str, dict]" = OrderedDict()
+def _dashboard_groups(now: float) -> "OrderedDict[tuple[str, str], dict]":
+    groups: "OrderedDict[tuple[str, str], dict]" = OrderedDict()
 
-    def bucket(project: str) -> dict:
-        return groups.setdefault(project, {"blocked": [], "working": [], "done": [], "idle": 0})
+    def bucket(key: tuple[str, str]) -> dict:
+        return groups.setdefault(key, {"blocked": [], "working": [], "done": [], "idle": 0})
 
     for rec in human_agents():
-        project = effective_project(rec)
+        key = (rec.get("host") or "local", effective_project(rec))
         status = rec.get("status", "unknown")
-        row = bucket(project)
+        row = bucket(key)
         if status == "blocked":
             row["blocked"].append(rec)
         elif status == "working":
@@ -918,8 +930,8 @@ def _dashboard_groups(now: float) -> "OrderedDict[str, dict]":
         else:
             row["idle"] += 1
 
-    def group_key(item: tuple[str, dict]) -> tuple:
-        project, row = item
+    def group_key(item: tuple[tuple[str, str], dict]) -> tuple:
+        (host, project), row = item
         if row["blocked"]:
             rank = 0
         elif row["working"]:
@@ -928,7 +940,7 @@ def _dashboard_groups(now: float) -> "OrderedDict[str, dict]":
             rank = 2
         else:
             rank = 3
-        return (rank, project.lower())
+        return (rank, project.lower(), 0 if host == "local" else 1, host.lower())
 
     return OrderedDict(sorted(groups.items(), key=group_key))
 
@@ -970,11 +982,12 @@ def render_dashboard(now: float | None = None) -> str:
 
     budget_lines = DASHBOARD_MAX_LINES
     hidden = 0
-    for project, row in groups.items():
+    for (host, project), row in groups.items():
         if budget_lines <= 2:
             hidden += sum(len(row[k]) for k in ("blocked", "working", "done"))
             continue
-        lines.append(f"\n<b>{_html_escape(project)}</b>")
+        header = project if host == "local" else f"{project} @{host}"
+        lines.append(f"\n<b>{_html_escape(header)}</b>")
         budget_lines -= 1
         blocked = sorted(row["blocked"], key=lambda a: _pane_line_label(a).lower())
         working = sorted(row["working"], key=lambda a: _pane_line_label(a).lower())
@@ -1012,7 +1025,7 @@ def _dashboard_block_button(rec: dict) -> str:
     project = _u16_truncate(effective_project(rec), 24)
     title = (rec.get("title") or "").strip() or rec.get("pane_id") or "?"
     session = (rec.get("label") or "").strip()
-    label = f"🚫 {project} · {title}"
+    label = f"🚫 {project}{_host_suffix(rec)} · {title}"
     if session:
         label += f" · {session}"
     return _u16_truncate(label, 60)
@@ -1167,7 +1180,9 @@ def _bar_short_identity(rec: dict) -> str:
     """
     project = effective_project(rec)
     session = _short_session(rec, project)
-    return _u16_truncate(f"{project} › {session}", 34)
+    # The bar is a cross-machine surface: without @host two coordinators of the
+    # same project on local + boe-fyq render as one indistinguishable key.
+    return _u16_truncate(f"{project} › {session}{_host_suffix(rec)}", 34)
 
 
 def _bar_specs() -> tuple[dict | None, list[tuple[str, dict]]]:

@@ -518,6 +518,52 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(slugs, ["zebra", "alpha", "mid"])
 
 
+class CrossMachineIdentityTests(unittest.TestCase):
+    """Every cross-machine surface must name the machine: with the same
+    project on local + boe-fyq, every identity string, header and button needs
+    @host or the remote copy is unreadable/untappable (pf.16)."""
+
+    def setUp(self):
+        self.tg = loaded_telegram()
+        self.tg.CHAT_ID = "42"
+        self.tg.relay_connected = True
+        self.local = _rec(
+            "wT:p1", project="lagrange-system", status="blocked",
+            title="local blocked", host="local", label="hpc-lagrange-system",
+        )
+        self.remote = _rec(
+            "w2:p1", project="lagrange-system", status="blocked",
+            title="remote blocked", host="boe-fyq", label="hpc-lagrange-system-1",
+        )
+        self.tg.agents = [self.local, self.remote]
+
+    def test_agent_identity_carries_host(self):
+        # /agents lines, notification headers, send receipts, bar placeholder.
+        self.assertIn("@boe-fyq", self.tg.agent_identity(self.remote))
+        self.assertNotIn("@", self.tg.agent_identity(self.local))
+
+    def test_focus_head_carries_host(self):
+        self.assertIn("@boe-fyq", self.tg.pane_focus_identity(self.remote))
+        self.assertNotIn("@", self.tg.pane_focus_identity(self.local))
+
+    def test_bar_short_identity_carries_host(self):
+        self.assertIn("@boe-fyq", self.tg._bar_short_identity(self.remote))
+        self.assertNotIn("@", self.tg._bar_short_identity(self.local))
+
+    def test_dashboard_splits_same_project_by_machine(self):
+        text = self.tg.render_dashboard(1_900_000_000)
+        self.assertIn("<b>lagrange-system</b>", text)
+        self.assertIn("<b>lagrange-system @boe-fyq</b>", text)
+
+    def test_dashboard_block_button_carries_host(self):
+        self.assertIn("@boe-fyq", self.tg._dashboard_block_button(self.remote))
+        self.assertNotIn("@", self.tg._dashboard_block_button(self.local))
+
+    def test_agents_pages_name_the_machine(self):
+        text = "\n".join(self.tg.agents_pages())
+        self.assertIn("@boe-fyq", text)
+
+
 class BarMarkupStaticKeysTests(unittest.TestCase):
     def test_new_static_keys_own_row_and_never_drop(self):
         tg = loaded_telegram()
