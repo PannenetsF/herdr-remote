@@ -1507,17 +1507,24 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
         labels = (tg.BAR_SWITCH_LABEL, tg.BAR_DASHBOARD_LABEL,
                   active_label, recent_label, tg.BAR_UNFOCUS_LABEL)
         tapped = []
+        bots = {}
         with patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text:
             for label in labels:
                 message = FakeMessage()
                 message.text = label
                 tapped.append((label, message))
-                await tg.handle_text(make_update(message=message), make_context(bot=FakeBot()))
+                bot = FakeBot()
+                bots[label] = bot
+                await tg.handle_text(make_update(message=message), make_context(bot=bot))
         send_text.assert_not_awaited()
-        # Every tap produced some feedback, none routed text to a pane.
-        self.assertTrue(all(m.replies for _label, m in tapped))
-        self.assertTrue(any("dashboard" in r[0].lower()
-                            for _l, m in tapped for r in m.replies))
+        # Non-dashboard taps answer via a chat reply; the dashboard tap posts a
+        # fresh singleton copy via the bot itself (no acknowledgement after it).
+        for label, message in tapped:
+            if label == tg.BAR_DASHBOARD_LABEL:
+                posted = [text for (_c, text, _kw, _m) in bots[label].sent]
+                self.assertTrue(any("dashboard" in t.lower() for t in posted))
+            else:
+                self.assertTrue(message.replies)
 
     async def test_unfocus_tap_clears_active(self):
         self._herd()

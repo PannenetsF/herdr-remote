@@ -265,6 +265,76 @@ class PendingBarShortcutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(message.replies[0][0], "当前没有待办。")
 
 
+class DashboardRepostTests(unittest.IsolatedAsyncioTestCase):
+    """Manual /dashboard retires the old singleton and posts at the bottom."""
+
+    class _DashboardBot:
+        def __init__(self, fail_delete=()):
+            self.sent = []
+            self.deleted = []
+            self.edited = []
+            self.fail_delete = set(fail_delete)
+
+        async def send_message(self, chat_id, text, **kwargs):
+            msg = types.SimpleNamespace(message_id=500 + len(self.sent))
+            self.sent.append((chat_id, text, kwargs, msg))
+            return msg
+
+        async def delete_message(self, chat_id, message_id):
+            if message_id in self.fail_delete:
+                raise RuntimeError("message can't be deleted")
+            self.deleted.append((chat_id, message_id))
+
+        async def edit_message_text(self, chat_id, message_id, text, **kwargs):
+            self.edited.append((chat_id, message_id, text))
+
+    def _ready(self, tg):
+        tg.CHAT_ID = "42"
+        tg.relay_connected = True
+        tg.agents = [_rec("wT:pB", project="nix-hm", status="blocked",
+                          label="hpc-nix-hm", title="stuck on a prompt")]
+
+    async def test_command_deletes_old_and_posts_fresh_without_ack(self):
+        tg = loaded_telegram()
+        self._ready(tg)
+        tg.dashboard_msg_id = 777
+        bot = self._DashboardBot()
+        msg = _FakeMessage()
+        await tg.cmd_dashboard(_update(message=msg), types.SimpleNamespace(bot=bot))
+        # The old singleton was retired and exactly one fresh copy was posted.
+        self.assertEqual(bot.deleted, [(42, 777)])
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(tg.dashboard_msg_id, 500)
+        # No separate acknowledgement: the new dashboard itself is the last word,
+        # ready to pin.
+        self.assertEqual(msg.replies, [])
+
+    async def test_later_snapshot_edits_the_new_message_not_the_old_one(self):
+        tg = loaded_telegram()
+        self._ready(tg)
+        tg.dashboard_msg_id = 777
+        bot = self._DashboardBot()
+        msg = _FakeMessage()
+        await tg.cmd_dashboard(_update(message=msg), types.SimpleNamespace(bot=bot))
+        # A subsequent snapshot-driven refresh (after its coalescing interval)
+        # edits message 500 in place.
+        tg.mark_dashboard_dirty()
+        await tg.push_dashboard(bot, force=True)
+        self.assertEqual([m for (_c, m, _t) in bot.edited], [500])
+        self.assertEqual(len(bot.sent), 1)  # no duplicate posting
+
+    async def test_failed_delete_still_reposts_and_tracks_new_message(self):
+        tg = loaded_telegram()
+        self._ready(tg)
+        tg.dashboard_msg_id = 777
+        bot = self._DashboardBot(fail_delete={777})
+        msg = _FakeMessage()
+        await tg.cmd_dashboard(_update(message=msg), types.SimpleNamespace(bot=bot))
+        self.assertEqual(bot.deleted, [])  # deletion attempted and failed
+        self.assertEqual(len(bot.sent), 1)
+        self.assertEqual(tg.dashboard_msg_id, 500)  # frozen old copy never tracked again
+
+
 class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.tg = loaded_telegram()

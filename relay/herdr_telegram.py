@@ -1125,6 +1125,31 @@ async def push_dashboard(bot, chat_id: int | None = None, force: bool = False):
     dash.update(last_text=sig[0], last_sig=sig[1], last_push=now, dirty=False)
 
 
+async def repost_dashboard(bot, chat_id: int):
+    """Explicit /dashboard: retire the old singleton and post at the bottom.
+
+    Snapshot-driven refresh only ever edits the singleton in place, so the
+    message stays wherever it was first posted -- after a day of chat it is
+    impossible to find when the user wants to pin it. A manual command is an
+    explicit "bring a fresh one here" request: delete the stale copy
+    best-effort and let push_dashboard post the new one, which then takes over
+    as the singleton future edits track. A deletion failure (too old, already
+    gone) leaves the old copy frozen and never blocks the repost.
+    """
+    global dashboard_msg_id
+    old = dashboard_msg_id
+    if old is not None:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=old)
+        except Exception as e:
+            log.info("old dashboard %s not deleted (%s); leaving it frozen",
+                     old, scrub(e))
+        # Forget it regardless of deletion outcome: from now on edits track
+        # the freshly posted message, never the frozen leftover.
+        dashboard_msg_id = None
+    await push_dashboard(bot, chat_id=chat_id, force=True)
+
+
 async def dashboard_loop(app: Application):
     """Coalesce the snapshot stream into edits at most every DASHBOARD_MIN_INTERVAL."""
     global state_dirty
@@ -1728,7 +1753,7 @@ DASHBOARD_HELP = (
 )
 
 
-async def _show_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
+async def _show_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE, repost: bool = False):
     if not CHAT_ID:
         await update.message.reply_text(
             f"herdr-remote bot\n\nYour chat id: {update.effective_chat.id}\n"
@@ -1738,7 +1763,12 @@ async def _show_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> boo
     bot = getattr(ctx, "bot", None)
     if bot is not None:
         try:
-            await push_dashboard(bot, chat_id=update.effective_chat.id, force=True)
+            if repost:
+                # Manual /dashboard (and the 📊 bar key): a fresh copy at the
+                # bottom the user can find and pin; the old singleton is retired.
+                await repost_dashboard(bot, update.effective_chat.id)
+            else:
+                await push_dashboard(bot, chat_id=update.effective_chat.id, force=True)
         except Exception as e:
             await update.message.reply_text(f"Dashboard update failed: {scrub(e)}")
             return False
@@ -1757,11 +1787,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_dashboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle /dashboard — force-refresh (and repost if deleted) the dashboard."""
+    """Handle /dashboard — retire the old singleton and post a fresh copy at the bottom.
+
+    No separate acknowledgement: the new dashboard message itself must be the
+    last message in the chat, so it is immediately visible and ready to pin.
+    """
     if not authorized(update):
         return
-    if await _show_dashboard(update, ctx):
-        await update.message.reply_text("Dashboard refreshed (pin it to keep it on top).")
+    await _show_dashboard(update, ctx, repost=True)
 
 
 async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
