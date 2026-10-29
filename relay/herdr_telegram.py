@@ -773,13 +773,6 @@ def sorted_agents(agent_list: list[dict]) -> list[dict]:
     ))
 
 
-def compact_identifier(value: str, limit: int) -> str:
-    if len(value) <= limit:
-        return value
-    digest = hashlib.sha1(value.encode()).hexdigest()[:12]
-    return value[:limit - 15] + "..." + digest
-
-
 def pane_callback_token(pane_id: str) -> str:
     return hashlib.sha256(pane_id.encode()).hexdigest()[:16]
 
@@ -814,52 +807,24 @@ def parse_callback_data(raw: str) -> dict:
     return data
 
 
-def agent_button_labels(agent_list: list[dict]) -> list[str]:
-    bases = []
-    contexts = []
-    for agent in agent_list:
-        status = STATUS_LABELS.get(agent.get("status", "unknown"), "UNKNOWN")
-        project = agent.get("project") or agent.get("cwd") or "unknown"
-        name = agent.get("agent") or "agent"
-        host = agent.get("host", "local")
-        bases.append(f"[{status}] {project} ({name})")
-        contexts.append(f" @{compact_identifier(host, 24)}" if host != "local" else "")
-
-    provisional = [base[:max(1, 64 - len(context))] + context for base, context in zip(bases, contexts)]
-    counts = Counter(provisional)
-    labels = []
-    for agent, base, context, candidate in zip(agent_list, bases, contexts, provisional):
-        if counts[candidate] == 1:
-            labels.append(candidate)
-            continue
-        pane_id = compact_identifier(agent.get("pane_id", "?"), 18)
-        suffix = context + f" [{pane_id}]"
-        labels.append(base[:max(1, 64 - len(suffix))] + suffix)
-    unique_labels = []
-    used = set()
-    for label in labels:
-        candidate = label
-        ordinal = 2
-        while candidate in used:
-            marker = f" #{ordinal}"
-            candidate = label[:64 - len(marker)] + marker
-            ordinal += 1
-        used.add(candidate)
-        unique_labels.append(candidate)
-    return unique_labels
-
-
 def build_agent_keyboard(action: str, page: int = 0, agent_list: list[dict] | None = None) -> InlineKeyboardMarkup:
+    """The full-list picker (behind 📋 All panes and the read/trust/... menus).
+
+    pf.12: rows use the SAME two-line label as /switch -- the terminal title
+    owns line 1 and `<project> › <pane_id> · <session> @host` is the identity
+    tail on line 2. The old single-line `[STATUS] project (agent) [pane]`
+    carried no title at all, so several hand-started `project (claude)` rows
+    in one project were indistinguishable.
+    """
     ordered = sorted_agents(agents_for_action(action) if agent_list is None else agent_list)
     page_count = max(1, (len(ordered) + AGENT_PAGE_SIZE - 1) // AGENT_PAGE_SIZE)
     page = min(max(page, 0), page_count - 1)
     start = page * AGENT_PAGE_SIZE
     visible = ordered[start:start + AGENT_PAGE_SIZE]
-    labels = agent_button_labels(ordered)[start:start + AGENT_PAGE_SIZE]
     keyboard = [[InlineKeyboardButton(
-        label,
+        _switch_pane_label(agent),
         callback_data=pane_callback_data(action, agent["pane_id"]),
-    )] for agent, label in zip(visible, labels)]
+    )] for agent in visible]
 
     if page_count > 1:
         navigation = []
@@ -1421,6 +1386,23 @@ def _short_session(rec: dict, project: str) -> str:
     return session
 
 
+def _pane_id_label(pane_id: str, budget: int) -> str:
+    """Pane id sized for a button tail, middle-ellipsized with the suffix kept.
+
+    herdr ids discriminate panes by their creation-counter tail (wT:p30 vs
+    wT:p3J, ...-2606 vs ...-3604); a head-only truncation that drops the tail
+    makes two long-id duplicates render identically. When the id fits it is
+    returned verbatim.
+    """
+    if _cell_len(pane_id) <= budget:
+        return pane_id
+    keep = max(1, min(4, budget - 1))
+    head_budget = budget - keep - 1            # one cell for the ellipsis
+    if head_budget <= 0:
+        return "…" + pane_id[-(budget - 1):]
+    return _cell_truncate(pane_id[:-keep], head_budget) + pane_id[-keep:]
+
+
 def _switch_pane_label(rec: dict) -> str:
     """Two-line phone button, each line within SWITCH_LABEL_CELLS display cells.
 
@@ -1440,7 +1422,7 @@ def _switch_pane_label(rec: dict) -> str:
     host_part = (
         f" @{_cell_truncate(host, SWITCH_HOST_CELLS)}" if host != "local" else ""
     )
-    pane_id = str(rec.get("pane_id") or "?")
+    pane_id_raw = str(rec.get("pane_id") or "?")
     title = (rec.get("title") or "").strip()
 
     head = f"{glyph} "
@@ -1448,7 +1430,13 @@ def _switch_pane_label(rec: dict) -> str:
         title or project, SWITCH_LABEL_CELLS - _cell_len(head)
     )
 
-    tail = f"{pane_id} · {session}{host_part}"
+    # Reserve the session/host tail first; a long pane id then gives up its
+    # MIDDLE, never the distinguishing suffix.
+    tail_without_id = f" · {session}{host_part}"
+    pane_id = _pane_id_label(
+        pane_id_raw, max(6, SWITCH_LABEL_CELLS - _cell_len(tail_without_id))
+    )
+    tail = f"{pane_id}{tail_without_id}"
     if title:
         # " › " costs 3 cells; a project tag shorter than 4 cells is noise.
         room = SWITCH_LABEL_CELLS - _cell_len(tail) - 3

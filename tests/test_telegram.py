@@ -242,17 +242,26 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
             *make_agents(1, status="working", project="work"),
             *make_agents(1, status="blocked", project="blocked"),
         ]
+        for rec in agent_list:
+            rec["title"] = "the pane topic"
         agent_list[-1]["host"] = "remote.example"
 
         markup = tg.build_agent_keyboard("read", agent_list=agent_list)
         labels = [row[0].text for row in markup.inline_keyboard]
 
-        self.assertTrue(labels[0].startswith("[BLOCKED]"))
-        self.assertTrue(labels[1].startswith("[WORKING]"))
-        self.assertIn("remote.example", labels[0])
-        duplicate_labels = [label for label in labels if "same" in label]
-        self.assertEqual(len(set(duplicate_labels)), 2)
-        self.assertTrue(all("w" in label and ":p1" in label for label in duplicate_labels))
+        # pf.12 two-line rows: status glyph + terminal title on line 1 ...
+        line1 = [label.split("\n")[0] for label in labels]
+        self.assertTrue(line1[0].startswith(tg.STATUS_GLYPH["blocked"]))
+        self.assertTrue(line1[1].startswith(tg.STATUS_GLYPH["working"]))
+        self.assertTrue(all("the pane topic" in first for first in line1))
+        # ... project > pane id . session @host on line 2 (host is capped to
+        # the host cell budget, so only its head survives).
+        line2 = [label.split("\n")[1] for label in labels]
+        self.assertIn("@remote", line2[0])
+        # Same-project duplicates are distinguishable by their pane id.
+        duplicate_lines = [line for line in line2 if "same" in line]
+        self.assertEqual(len(set(duplicate_lines)), 2)
+        self.assertTrue(all("w0:p1" in line or "w1:p1" in line for line in duplicate_lines))
 
     def test_large_keyboard_paginates_without_omitting_agents(self):
         agent_list = make_agents(tg.AGENT_PAGE_SIZE + 5)
@@ -267,7 +276,7 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(second_ids), 5)
         self.assertEqual(len(set(first_ids + second_ids)), tg.AGENT_PAGE_SIZE + 5)
 
-    def test_long_labels_remain_unique_and_preserve_remote_host(self):
+    def test_long_labels_keep_every_line_in_the_phone_cell_budget(self):
         long_prefix = "project-" + "x" * 70
         agent_list = make_agents(3)
         agent_list[0]["project"] = long_prefix + "-one"
@@ -279,8 +288,11 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         labels = [row[0].text for row in markup.inline_keyboard]
 
         self.assertEqual(len(set(labels)), 3)
-        self.assertTrue(any("@remote-" in label for label in labels))
-        self.assertTrue(all(len(label) <= 64 for label in labels))
+        for label in labels:
+            for line in label.split("\n"):
+                self.assertLessEqual(tg._cell_len(line), tg.SWITCH_LABEL_CELLS)
+        joined = "\n".join(labels)
+        self.assertIn("@remote-", joined)
 
     def test_compacted_pane_hash_collision_still_has_unique_labels(self):
         agent_list = make_agents(2, project="same")
@@ -291,7 +303,9 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         labels = [row[0].text for row in markup.inline_keyboard]
 
         self.assertEqual(len(set(labels)), 2)
-        self.assertTrue(all(len(label) <= 64 for label in labels))
+        for label in labels:
+            for line in label.split("\n"):
+                self.assertLessEqual(tg._cell_len(line), tg.SWITCH_LABEL_CELLS)
 
     def test_all_pane_callbacks_fit_telegram_byte_limit(self):
         pane_id = "pane-" + "кирилица" * 100
