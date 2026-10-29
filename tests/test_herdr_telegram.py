@@ -370,9 +370,48 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
         for b in buttons:
             self.assertLessEqual(len(b.callback_data.encode()), 64)
 
+    def test_same_slug_on_two_machines_stays_two_rows(self):
+        """The whole reason for (host, slug) keys: lagrange-system running
+        locally and on boe-fyq must produce two project rows, with the remote
+        one tagged @host so it is discoverable; each second level then lists
+        only that machine's sessions."""
+        tg = self.tg
+        tg.agents = [
+            _rec("wT:p1", project="lagrange-system", status="working",
+                 title="local coord", host="local", label="hpc-lagrange-system"),
+            _rec("w2:p1", project="lagrange-system", status="blocked",
+                 title="remote coord", host="boe-fyq", label="hpc-lagrange-system-1"),
+        ]
+        buttons = _flat(tg.build_project_keyboard())
+        self.assertEqual(len(buttons), 2)
+        labels = [b.text for b in buttons]
+        # The blocked remote sorts first (blocked-count is the primary key);
+        # what matters is both machine copies exist and only the remote is tagged.
+        self.assertEqual(sum("@boe-fyq" in l for l in labels), 1)
+        self.assertTrue(
+            any(l.startswith("📁 lagrange-system") and "@" not in l for l in labels)
+        )
+        for b in buttons:
+            self.assertLessEqual(len(b.callback_data.encode()), 64)
+        # Second level isolates machines.
+        remote_markup = tg.build_project_sessions_keyboard(("boe-fyq", "lagrange-system"))
+        pane_ids = {
+            tg.parse_callback_data(b.callback_data)["pane_id"]
+            for b in _flat(remote_markup)
+            if tg.parse_callback_data(b.callback_data).get("action") == "switch"
+        }
+        self.assertEqual(pane_ids, {"w2:p1"})
+        local_markup = tg.build_project_sessions_keyboard(("local", "lagrange-system"))
+        pane_ids = {
+            tg.parse_callback_data(b.callback_data)["pane_id"]
+            for b in _flat(local_markup)
+            if tg.parse_callback_data(b.callback_data).get("action") == "switch"
+        }
+        self.assertEqual(pane_ids, {"wT:p1"})
+
     def test_session_level_lists_only_that_projects_human_panes(self):
         tg = self.tg
-        markup = tg.build_project_sessions_keyboard("alpha")
+        markup = tg.build_project_sessions_keyboard(("local", "alpha"))
         pane_buttons = [
             b for b in _flat(markup)
             if tg.parse_callback_data(b.callback_data).get("action") == "switch"
@@ -386,13 +425,13 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
 
     def test_back_button_returns_to_project_list(self):
         tg = self.tg
-        markup = tg.build_project_sessions_keyboard("alpha")
+        markup = tg.build_project_sessions_keyboard(("local", "alpha"))
         back = next(b for b in _flat(markup)
                     if tg.json.loads(b.callback_data).get("action") == "proj-list")
         self.assertIn("返回项目列表", back.text)
 
     def test_unknown_slug_has_no_keyboard(self):
-        self.assertIsNone(self.tg.build_project_sessions_keyboard("ghost"))
+        self.assertIsNone(self.tg.build_project_sessions_keyboard(("local", "ghost")))
 
     async def test_project_command_posts_the_same_project_list(self):
         tg = self.tg
@@ -411,7 +450,7 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
             _rec(f"wT:p{i:02d}", project="big", status="idle", title=f"session {i}")
             for i in range(tg.PROJECT_PAGE_SIZE + 3)
         ]
-        first = tg.build_project_sessions_keyboard("big", page=0)
+        first = tg.build_project_sessions_keyboard(("local", "big"), page=0)
         pane_buttons = [
             b for b in _flat(first)
             if tg.parse_callback_data(b.callback_data).get("action") == "switch"
@@ -421,7 +460,7 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
                    if tg.json.loads(b.callback_data).get("action") == "proj-page")
         self.assertEqual(nxt.text, "Next")
         second = tg.build_project_sessions_keyboard(
-            "big", page=tg.json.loads(nxt.callback_data)["page"]
+            ("local", "big"), page=tg.json.loads(nxt.callback_data)["page"]
         )
         pane_buttons = [
             b for b in _flat(second)
@@ -437,7 +476,7 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
         raw = tg.json.loads(button.callback_data)
         self.assertLessEqual(len(button.callback_data.encode()), 64)
         self.assertNotIn("s", raw)
-        self.assertEqual(tg._resolve_project_key(raw), long_slug)
+        self.assertEqual(tg._resolve_project_key(raw), ("local", long_slug))
 
     async def test_stale_slug_tap_offers_fresh_list(self):
         tg = self.tg
@@ -455,7 +494,7 @@ class ProjectDrillDownTests(unittest.IsolatedAsyncioTestCase):
     async def test_project_then_session_tap_focuses_and_previews(self):
         tg = self.tg
         tg.read_views.clear()
-        markup = tg.build_project_sessions_keyboard("alpha")
+        markup = tg.build_project_sessions_keyboard(("local", "alpha"))
         target = next(
             b for b in _flat(markup)
             if tg.parse_callback_data(b.callback_data).get("pane_id") == "wT:p3"

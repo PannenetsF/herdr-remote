@@ -1546,82 +1546,105 @@ async def send_focus_view(bot, message, chat, rec: dict):
 PROJECT_PAGE_SIZE = SWITCH_PAGE_SIZE
 
 
-def _project_rows() -> list[tuple[str, dict]]:
-    """Projects with >=1 human pane: (slug, {blocked, working, panes}).
+def _project_rows() -> list[tuple[tuple[str, str], dict]]:
+    """(host, slug)-keyed projects with >=1 human pane.
 
-    Ordered blocked-count desc, then project name; the panes inside each
-    project keep sorted_agents' status ranking so the neediest is first.
+    A project with the same slug on two machines (lagrange-system running
+    locally AND on boe-fyq) must stay TWO rows: a slug-only merge gave no
+    sign that the remote copy existed and buried its sessions behind the
+    local ones -- mirroring the sidebar's machine-namespaced grouping and
+    Portal's [machine] cards.
+
+    Ordered blocked-count desc, then slug; local sorts before a remote with
+    the same slug. The panes inside each group keep sorted_agents' status
+    ranking so the neediest is first.
     """
-    by_project: dict[str, dict] = {}
+    by_project: dict[tuple[str, str], dict] = {}
     for rec in sorted_agents(human_agents()):
-        slug = effective_project(rec)
-        row = by_project.setdefault(slug, {"blocked": 0, "working": 0, "panes": []})
+        key = (rec.get("host") or "local", effective_project(rec))
+        row = by_project.setdefault(key, {"blocked": 0, "working": 0, "panes": []})
         row["panes"].append(rec)
         if rec.get("status") == "blocked":
             row["blocked"] += 1
         elif rec.get("status") == "working":
             row["working"] += 1
-    ordered = sorted(by_project.items(), key=lambda kv: (-kv[1]["blocked"], kv[0].lower()))
-    return [(slug, row) for slug, row in ordered]
+    ordered = sorted(
+        by_project.items(),
+        key=lambda kv: (
+            -kv[1]["blocked"], kv[0][1].lower(),
+            0 if kv[0][0] == "local" else 1, kv[0][0].lower(),
+        ),
+    )
+    return ordered
 
 
-def _project_button_label(slug: str, row: dict) -> str:
-    """`📁 <project> · 🚫n ▶️n`, zero counts omitted, capped to one button line."""
+def _project_button_label(key: tuple[str, str], row: dict) -> str:
+    """`📁 <project>[ @host] · 🚫n ▶️n`, zero counts omitted, one button line."""
+    host, slug = key
     counts = []
     if row["blocked"]:
         counts.append(f"🚫{row['blocked']}")
     if row["working"]:
         counts.append(f"▶️{row['working']}")
     label = "📁 " + slug
+    if host != "local":
+        label += f" @{host}"
     if counts:
         label += " · " + " ".join(counts)
     return _cell_truncate(label, SWITCH_LABEL_CELLS)
 
 
-# The callback must fit in 64 bytes: {"action":"proj-open","s":"<slug>"}
-# leaves ~44 bytes for the slug. Real project slugs are short; a longer one is
-# sent as a hash token and re-resolved from the live snapshot at tap time,
-# exactly like pane tokens.
-def _project_cb(slug: str, action: str, **extra) -> str:
-    direct = _switch_cb(action=action, s=slug, **extra)
+# The callback must fit in 64 bytes: {"action":"proj-open","s":"<slug>",
+# "h":"<host>"}. A long slug goes as a per-(host,slug) hash token and is
+# re-resolved from the live snapshot at tap time, exactly like pane tokens.
+def _project_cb(key: tuple[str, str], action: str, **extra) -> str:
+    host, slug = key
+    direct = _switch_cb(action=action, s=slug, h=host, **extra)
     if len(direct.encode()) <= 64:
         return direct
-    token = hashlib.sha1(slug.encode()).hexdigest()[:12]
-    return _switch_cb(action=action, pt=token, **extra)
+    token = hashlib.sha1(host.encode() + b"\0" + slug.encode()).hexdigest()[:12]
+    return _switch_cb(action=action, pt=token, h=host, **extra)
 
 
-def _resolve_project_key(data: dict) -> str | None:
-    """Map a tap-time project key (slug or hash token) back to a live slug."""
+def _resolve_project_key(data: dict) -> tuple[str, str] | None:
+    """Map a tap-time callback back to a live (host, slug) project key."""
     rows = _project_rows()
+    host = data.get("h")
     slug = data.get("s")
-    if isinstance(slug, str) and any(project == slug for project, _r in rows):
-        return slug
+    if isinstance(host, str) and isinstance(slug, str) and any(
+        key == (host, slug) for key, _r in rows
+    ):
+        return host, slug
     token = data.get("pt")
-    if isinstance(token, str):
-        for project, _r in rows:
-            if hashlib.sha1(project.encode()).hexdigest()[:12] == token:
-                return project
+    if isinstance(host, str) and isinstance(token, str):
+        for (row_host, project), _r in rows:
+            if row_host == host and hashlib.sha1(
+                row_host.encode() + b"\0" + project.encode()
+            ).hexdigest()[:12] == token:
+                return row_host, project
     return None
 
 
 def build_project_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(
-            _project_button_label(slug, row),
-            callback_data=_project_cb(slug, "proj-open"),
+            _project_button_label(key, row),
+            callback_data=_project_cb(key, "proj-open"),
         )]
-        for slug, row in _project_rows()
+        for key, row in _project_rows()
     ]
     return InlineKeyboardMarkup(rows)
 
 
-def _find_project(slug: str) -> dict | None:
-    return next((row for project, row in _project_rows() if project == slug), None)
+def _find_project(key: tuple[str, str]) -> dict | None:
+    return next((row for project_key, row in _project_rows() if project_key == key), None)
 
 
-def build_project_sessions_keyboard(slug: str, page: int = 0) -> InlineKeyboardMarkup | None:
-    """Second level: the project's human sessions in the /switch two-line style."""
-    row = _find_project(slug)
+def build_project_sessions_keyboard(
+    key: tuple[str, str], page: int = 0
+) -> InlineKeyboardMarkup | None:
+    """Second level: one machine's project sessions in /switch two-line style."""
+    row = _find_project(key)
     if row is None:
         return None
     panes = row["panes"]
@@ -1638,11 +1661,11 @@ def build_project_sessions_keyboard(slug: str, page: int = 0) -> InlineKeyboardM
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton(
-            "Previous", callback_data=_project_cb(slug, "proj-page", page=page - 1),
+            "Previous", callback_data=_project_cb(key, "proj-page", page=page - 1),
         ))
     if page + 1 < page_count:
         nav.append(InlineKeyboardButton(
-            "Next", callback_data=_project_cb(slug, "proj-page", page=page + 1),
+            "Next", callback_data=_project_cb(key, "proj-page", page=page + 1),
         ))
     if nav:
         keyboard.append(nav)
@@ -2255,19 +2278,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if action in ("proj-open", "proj-page"):
-        slug = _resolve_project_key(data)
+        key = _resolve_project_key(data)
         page = 0
         if action == "proj-page":
             try:
                 page = int(data.get("page", 0))
             except (TypeError, ValueError):
                 page = 0
-        if slug is None:
-            # Stale slug/token: the project vanished since the list was drawn.
-            # Re-resolve from the live snapshot and offer the fresh list.
+        if key is None:
+            # Stale key/token: the (host, project) vanished since the list was
+            # drawn. Re-resolve from the live snapshot and offer the fresh list.
             await _reply_projects(query.message, "该项目已不在当前列表中，重新选择：")
             return
-        markup = build_project_sessions_keyboard(slug, page=page)
+        markup = build_project_sessions_keyboard(key, page=page)
         if markup is None:
             await _reply_projects(query.message, "该项目已不在当前列表中，重新选择：")
             return
