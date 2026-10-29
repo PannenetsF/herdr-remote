@@ -569,6 +569,51 @@ class RelayActivityPersistenceTests(unittest.TestCase):
 
                     self.assertEqual(agents[0]["label"], "pane name")
 
+    def test_agent_list_tokens_reach_the_pane_record(self):
+        """herdr-projects' hp_* classification is the audience authority the
+        Telegram bot mirrors; it must survive the relay hop verbatim instead of
+        the bot guessing from cwd basenames (the bogus "workspace" project)."""
+        agent_list = json.dumps({"result": {"agents": [{
+            "pane_id": "w1:p1",
+            "name": "road-42",
+            "tokens": {
+                "hp_role": "other",
+                "hp_project": "",
+                "hp_audience": "internal",
+                "hp_group": "~!w1:p1",
+            },
+        }]}})
+        with loaded_relay() as relay:
+            with mock.patch.object(
+                relay,
+                "run_herdr",
+                side_effect=[self._pane_list(), self._workspace_list(), agent_list],
+            ):
+                agents = relay.get_agents_from_host()
+
+        self.assertEqual(agents[0]["label"], "road-42")
+        self.assertEqual(agents[0]["hp_role"], "other")
+        self.assertEqual(agents[0]["hp_project"], "")
+        self.assertEqual(agents[0]["hp_audience"], "internal")
+        self.assertEqual(agents[0]["hp_group"], "~!w1:p1")
+
+    def test_agent_list_without_tokens_leaves_hp_fields_empty(self):
+        """An older server without herdr-projects must still classify: empty
+        tokens, never a KeyError, so the bot fails open on its own heuristic."""
+        with loaded_relay() as relay:
+            with mock.patch.object(
+                relay,
+                "run_herdr",
+                side_effect=[self._pane_list(), self._workspace_list(),
+                             json.dumps({"result": {"agents": [
+                                 {"pane_id": "w1:p1", "name": "plain"}]}})],
+            ):
+                agents = relay.get_agents_from_host()
+
+        self.assertEqual(agents[0]["label"], "plain")
+        self.assertEqual(agents[0]["hp_role"], "")
+        self.assertEqual(agents[0]["hp_audience"], "")
+
     def test_unusable_workspace_list_leaves_workspace_label_empty(self):
         for raw in ("", "not json", json.dumps({"result": {}})):
             with self.subTest(raw=raw):

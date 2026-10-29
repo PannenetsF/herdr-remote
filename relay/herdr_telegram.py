@@ -628,6 +628,10 @@ _HP_NAME_RE = re.compile(r"^hpc?-(.+?)(?:-t-\d+)?$")
 
 
 def effective_project(rec: dict) -> str:
+    # herdr-projects' registered slug is authoritative when present.
+    hp_project = (rec.get("hp_project") or "").strip()
+    if hp_project:
+        return hp_project
     cwd = rec.get("cwd") or ""
     m = _HP_THREAD_CWD_RE.search(cwd)
     if m:
@@ -694,16 +698,26 @@ def identity_for_blocked(msg: dict) -> str:
 
 # --- Human audience: coordinators and manual sessions, never thread workers -
 #
-# Mirrors config/herdr/portal-policy.py's human projection. herdr-projects thread
-# workers are registered as hp-<slug>-t-N (and live in .../<slug>/threads/t-N
-# worktrees): their prompts and completions belong to the coordinator that owns
-# the thread, so they never reach Telegram. Coordinators hpc-<slug>[ -N] and
-# ordinary manually started sessions do; missing markers must not hide a newly
-# started remote session (fail open).
+# Mirrors config/herdr/portal-policy.py's human projection. With herdr-projects
+# tokens the hp_role classification is authoritative: the sidebar's default
+# agents view hides hp_role in (guest, other), and the human projection goes one
+# step further and also hides thread workers -- their prompts and completions
+# belong to the coordinator that owns the thread. The single exception is a
+# thread escalated to hp_audience=stalled: a worker the coordinator could not
+# resolve past the stall timeout is surfaced precisely so it reaches the human
+# (its blocked prompt is one tap to approve). Hosts without herdr-projects
+# (older server, a plain remote) send no tokens, so fall back to name/cwd
+# markers and fail open rather than hiding a newly started remote session.
 _HP_THREAD_NAME_RE = re.compile(r"^hp-.+-t-\d+")
+_HP_ROLES_VISIBLE = {"coordinator", "session"}
 
 
 def pane_human(rec: dict) -> bool:
+    role = (rec.get("hp_role") or "").strip()
+    if role:
+        if role in _HP_ROLES_VISIBLE:
+            return True
+        return role == "thread" and (rec.get("hp_audience") or "").strip() == "stalled"
     name = (rec.get("label") or "").strip()
     if name.startswith("hpc-"):
         return True

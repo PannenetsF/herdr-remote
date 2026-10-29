@@ -1139,6 +1139,57 @@ class AudienceGateTests(unittest.TestCase):
         self.assertEqual({a["pane_id"] for a in tg.human_agents()}, {"w:1", "w:3", "w:5"})
 
 
+def _tok_rec(pane_id, role, *, audience="human", slug="proj", **kw):
+    rec = _rec(pane_id, **kw)
+    rec.update(hp_role=role, hp_audience=audience, hp_project=slug)
+    return rec
+
+
+class HpRoleAudienceGateTests(unittest.TestCase):
+    def test_token_roles_are_authoritative(self):
+        # Registered coordinator and ordinary session rows stay visible.
+        self.assertTrue(tg.pane_human(_tok_rec("a", "coordinator", label="hpc-proj")))
+        self.assertTrue(tg.pane_human(_tok_rec("b", "session", label="", project="work")))
+        # Thread workers, guests and stray/other panes are hidden -- this is
+        # what removes the bogus "workspace" project (cwd basename) from the bot.
+        self.assertFalse(tg.pane_human(_tok_rec("c", "thread", label="hp-proj-t-0003")))
+        self.assertFalse(tg.pane_human(_tok_rec("d", "guest")))
+        self.assertFalse(
+            tg.pane_human(_tok_rec("e", "other", audience="internal",
+                                   label="road-42", project="workspace",
+                                   cwd="/Users/me/Documents/workspace"))
+        )
+
+    def test_stalled_thread_worker_still_reaches_the_human(self):
+        stalled = _tok_rec("c", "thread", audience="stalled", label="hp-proj-t-0003")
+        self.assertTrue(tg.pane_human(stalled))
+
+    def test_token_role_overrides_name_heuristic(self):
+        # A coordinator-classified row never gets hidden by a thread-like cwd,
+        # and a session-looking row classified other is hidden regardless of name.
+        mislabeled_coord = _tok_rec("a", "coordinator", cwd="/x/proj/threads/t-0001")
+        self.assertTrue(tg.pane_human(mislabeled_coord))
+        stray = _tok_rec("b", "other", label="plain-shell", project="plain-shell")
+        self.assertFalse(tg.pane_human(stray))
+
+    def test_hp_project_is_the_grouping_authority(self):
+        # Registered slug wins over relay's basename(cwd) guess.
+        rec = _tok_rec("a", "session", slug="herdr-remote",
+                       cwd="/Users/me/Documents/workspace", project="workspace")
+        self.assertEqual(tg.effective_project(rec), "herdr-remote")
+
+    def test_human_agents_mirror_sidebar_filter_with_tokens(self):
+        tg.agents = [
+            _tok_rec("w:1", "coordinator", slug="alpha", label="hpc-alpha"),
+            _tok_rec("w:2", "thread", slug="alpha", label="hp-alpha-t-0001"),
+            _tok_rec("w:3", "other", slug="", project="workspace",
+                     cwd="/Users/me/Documents/workspace", label="road-42"),
+            _tok_rec("w:4", "session", slug="beta", label="", project="beta"),
+            _tok_rec("w:5", "guest", slug="beta"),
+        ]
+        self.assertEqual({a["pane_id"] for a in tg.human_agents()}, {"w:1", "w:4"})
+
+
 class ThreadSilenceTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.old_chat_id = tg.CHAT_ID

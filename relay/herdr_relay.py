@@ -1057,30 +1057,26 @@ def get_workspace_labels(remote=None):
         return {}
 
 
-def get_agent_names(remote=None):
-    """Map pane_id to the agent's own name in herdr ("mfc-exec", "dre-rev-1").
+def get_agent_rows(remote=None):
+    """Map pane_id to the full row `herdr agent list` reports for it.
 
-    This is a second CLI call on a hot path, which the module otherwise avoids -- but the name
-    lives nowhere else. `pane list` carries the harness kind (`agent: "claude"`) and the pane's
-    own label, never the agent's name, so an agent started as `mfc-exec` reaches every client as
-    an empty label and is rendered as `w5:pH`.
+    The row's `name` is the agent's own name in herdr ("mfc-exec",
+    "dre-rev-1"); it lives nowhere else -- `pane list` carries only the harness
+    kind and the pane label, so without this map a renamed agent reached every
+    client as an empty label. `rename_agent` sets exactly this field.
 
-    It also makes `rename_agent` mean something. That handler shells out to `herdr agent rename`,
-    which sets exactly this field -- so before this map existed, renaming from the app wrote a
-    name that no client could ever read back.
-
-    Shaped like get_workspace_labels() and called on the same condition (only when there are
-    panes), so an idle host adds no round trips.
+    pf.14: the row also carries herdr-projects' `tokens` (hp_role / hp_project
+    / hp_group / hp_audience). Those are the authoritative audience
+    classification the sidebar filters on, so the Telegram bot must see them
+    rather than guess "is this a thread?" from the cwd. Both pieces come from
+    this one CLI call, adding no round trips. Shaped like get_workspace_labels()
+    and called only when there are panes, so an idle host adds none.
     """
     raw = run_herdr("agent", "list", remote=remote)
     try:
         data = json.loads(raw)
         agents = data.get("result", {}).get("agents", [])
-        return {
-            a["pane_id"]: a["name"]
-            for a in agents
-            if a.get("pane_id") and a.get("name")
-        }
+        return {a["pane_id"]: a for a in agents if a.get("pane_id")}
     except (json.JSONDecodeError, KeyError):
         return {}
 
@@ -1178,7 +1174,7 @@ def list_panes_from_host(remote=None):
         data = json.loads(raw)
         panes = data.get("result", {}).get("panes", [])
         workspace_labels = get_workspace_labels(remote=remote) if panes else {}
-        agent_names = get_agent_names(remote=remote) if panes else {}
+        agent_rows = get_agent_rows(remote=remote) if panes else {}
     except (json.JSONDecodeError, KeyError):
         return [], []
 
@@ -1208,6 +1204,7 @@ def list_panes_from_host(remote=None):
         # 9k lines back there" without a probe read. Shell panes are the ones with a ring; they
         # aren't listed yet, but the field is theirs too.
         scroll = p.get("scroll") or {}
+        agent_row = agent_rows.get(p["pane_id"], {})
         agents.append({
             "pane_id": p["pane_id"],
             "agent": p.get("agent")
@@ -1215,7 +1212,16 @@ def list_panes_from_host(remote=None):
             # The agent's name first, the pane's label second. herdr keeps the two apart and
             # `pane list` only carries the latter, which nothing sets by default -- so this field
             # was empty for every agent on the host and clients fell back to the pane id.
-            "label": agent_names.get(p["pane_id"]) or p.get("label", ""),
+            "label": agent_row.get("name") or p.get("label", ""),
+            # herdr-projects audience classification (pf.14), straight from the
+            # agent row's tokens. hp_role is coordinator/thread/guest/other;
+            # hp_project is the registered project slug; hp_audience further
+            # marks internal/stalled panes. Older herdr without the plugin has
+            # no tokens -- the client then falls back to its name/cwd heuristic.
+            "hp_role": (agent_row.get("tokens") or {}).get("hp_role", ""),
+            "hp_project": (agent_row.get("tokens") or {}).get("hp_project", ""),
+            "hp_audience": (agent_row.get("tokens") or {}).get("hp_audience", ""),
+            "hp_group": (agent_row.get("tokens") or {}).get("hp_group", ""),
             # Names the space, and stands in for panes that have no label.
             "workspace_label": workspace_labels.get(p.get("workspace_id", ""), ""),
             "status": p.get("agent_status", "unknown"),
