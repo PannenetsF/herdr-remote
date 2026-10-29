@@ -2526,7 +2526,13 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # already mark the bar dirty and the loop swaps it within ~1s, so typing a
     # message must not spawn a send+deleted placeholder of its own.
     try:
-        prompt_id = blocked_prompt_ids.get(target_id)
+        # Answer the CURRENT question only while the pane is actually blocked:
+        # the cached prompt_id outlives the question (it is cleared on the next
+        # status change, but a snapshot can lag), and routing a brand-new
+        # instruction through `respond` then fails relay's "no question
+        # detected" guard and the text vanishes. A non-blocked pane gets a
+        # fresh `agent prompt`.
+        prompt_id = blocked_prompt_ids.get(target_id) if rec.get("status") == "blocked" else None
         if prompt_id:
             await send_to_relay(target_id, message.text, prompt_id=prompt_id)
         else:

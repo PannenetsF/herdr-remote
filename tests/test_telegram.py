@@ -864,6 +864,27 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         )
         send_text.assert_not_awaited()
 
+    async def test_focused_working_pane_with_stale_prompt_id_uses_agent_prompt(self):
+        # pf.17: blocked_prompt_ids can hold an entry whose question is already
+        # gone (snapshot status flipped back to working). The text is a new
+        # instruction, so it must go through `agent prompt`; routing it through
+        # `respond` hits relay's "no question detected" guard and vanishes.
+        tg.relay_connected = True
+        tg.agents = make_agents(1, status="working")
+        tg.blocked_prompt_ids["w0:p1"] = "stale-prompt"
+        tg.active_pane = "w0:p1"
+        message = FakeMessage()
+        message.text = "把这些结果更新到飞书文档里"
+
+        with (
+            patch.object(tg, "send_to_relay", AsyncMock()) as send_response,
+            patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text,
+        ):
+            await tg.handle_text(make_update(message=message), SimpleNamespace())
+
+        send_text.assert_awaited_once_with("w0:p1", "把这些结果更新到飞书文档里")
+        send_response.assert_not_awaited()
+
     async def test_mapped_reply_rejects_disconnected_and_stale_panes(self):
         tg.register_pending(42, 77, "w0:p1")
         message = FakeMessage()

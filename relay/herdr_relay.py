@@ -2755,6 +2755,82 @@ def deliver_checkbox_free_text(pane_id, text, remote=None):
     return _mutate_herdr("pane", "send-text", pane_id, text, remote=remote)
 
 
+def numbered_question_free_text_index(options):
+    """The 1-based row of a numbered question menu's custom-answer row, or None.
+
+    Claude's single-select question menus end with "N. Type something." (omp
+    names it "Other (type your own)") followed by a non-numbered
+    "Chat about this". A plain approval menu has neither, and a numbered list
+    inside an agent's own output also has neither -- this index is what makes a
+    free-form sentence answerable without mistaking either of those for a menu.
+    """
+    for index, label in enumerate(options, start=1):
+        if label.casefold().rstrip(".") in QUESTION_FREE_TEXT_LABELS_NO_DOT:
+            return index
+    return None
+
+
+# QUESTION_FREE_TEXT_LABELS keeps the dotted variants for exact-row matching;
+# detection here compares against the labels with a trailing dot stripped
+# because detect_numbered_options preserves it ("Type something.").
+QUESTION_FREE_TEXT_LABELS_NO_DOT = {
+    label.rstrip(".") for label in QUESTION_FREE_TEXT_LABELS
+}
+
+
+def detect_numbered_question_menu(content):
+    """(options, free_text_index) for a REAL Claude numbered question menu, else None.
+
+    detect_numbered_options alone cannot be trusted: a five-step markdown list
+    in the agent's own answer matches the same 1..N run, and a relay that
+    navigated it would send arrow keys into an unrelated program. A question
+    menu additionally (a) carries the "Type something." custom-answer row and
+    (b) paints its invariant "Enter to select · ↑/↓ to navigate · Esc to
+    cancel" footer. Both survive whitespace normalization across pane widths.
+    Measured on a live refusal (2026-10): the screen showed numbered=5 from
+    document content with no menu footer, which is exactly the case this still
+    refuses.
+    """
+    options = detect_numbered_options(content)
+    free_index = numbered_question_free_text_index(options)
+    if free_index is None:
+        return None
+    if "to navigate" not in " ".join(content.split()).lower():
+        return None
+    return options, free_index
+
+
+def deliver_numbered_free_text(pane_id, text, free_index, remote=None):
+    """Answer a single-select numbered question menu with arbitrary text.
+
+    Same interaction respond_to_question drives for omp: walk the cursor onto
+    the "Type something." row, press Enter to turn it into the inline input,
+    wait for the field to open, then type the answer and submit. The digit
+    shortcuts cannot do this -- on a single-select menu a digit just picks that
+    row, which is also why arbitrary text used to be refused outright once the
+    option-label match failed.
+    """
+    content = question_screen(pane_id, remote=remote)
+    current = menu_cursor_row(content)
+    if current is None:
+        return False
+    direction = "Down" if free_index >= current else "Up"
+    keys = [direction] * abs(free_index - current) + ["Enter"]
+    if not _mutate_herdr("pane", "send-keys", pane_id, *keys, remote=remote):
+        return False
+    deadline = time.monotonic() + 1.5
+    while time.monotonic() < deadline:
+        screen = read_pane(pane_id, remote=remote)
+        if custom_editor_active(screen):
+            break
+        time.sleep(0.05)
+    else:
+        return False
+    return _mutate_herdr("pane", "send-text", pane_id, text, remote=remote) and _mutate_herdr(
+        "pane", "send-keys", pane_id, "Enter", remote=remote
+    )
+
+
 def respond_to_question(pane_id, text, question, remote=None):
     options = question["options"]
     target_index = next(
@@ -3467,6 +3543,17 @@ async def handle_client(ws):
                     and bool(detect_checkbox_options(content))
                     and free_text_row_number(content) is not None
                 )
+                # A single-select question menu (footer-verified, not a markdown list in the
+                # agent's output) accepts arbitrary text via its "Type something." row; see
+                # deliver_numbered_free_text. Only when the inline field is NOT already open --
+                # when it is, the plain "text" route below types straight into it.
+                numbered_menu = (
+                    not question
+                    and not menu_key
+                    and not checkbox_text
+                    and not custom_editor_active(content)
+                    and detect_numbered_question_menu(content)
+                )
                 # Decided ONCE. The log line and the dispatch below used to evaluate this same
                 # chain separately, so a change to one of them silently made the other lie about
                 # where a reader's text had gone -- and it cost two extra screen scans.
@@ -3476,6 +3563,8 @@ async def handle_client(ws):
                     route = "menu"
                 elif checkbox_text:
                     route = "checkbox-text"
+                elif numbered_menu:
+                    route = "numbered-text"
                 elif custom_editor_active(content) or text.lower() in SAFE_RESPONSES:
                     route = "text"
                 else:
@@ -3497,6 +3586,11 @@ async def handle_client(ws):
                 elif route == "checkbox-text":
                     delivered = await asyncio.to_thread(
                         deliver_checkbox_free_text, pane_id, text, remote=remote
+                    )
+                elif route == "numbered-text":
+                    _options, free_index = numbered_menu
+                    delivered = await asyncio.to_thread(
+                        deliver_numbered_free_text, pane_id, text, free_index, remote=remote
                     )
                 elif route == "text":
                     delivered = await asyncio.to_thread(

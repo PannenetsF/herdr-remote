@@ -3428,6 +3428,94 @@ class ClaudeNumberedMenuTests(unittest.TestCase):
             self.assertNotEqual(message["interaction"], "numbered")
 
 
+# The live refusal (2026-10): the agent's own document output contained a five-step
+# markdown list, so detect_numbered_options returned 5 options with no real menu on
+# screen. Free text had to stay refused there. The real question menu below is the
+# single-select shape that DOES accept arbitrary text via its "Type something." row.
+NUMBERED_QUESTION_REAL = """\
+ What should I update next?
+
+ ❯ 1. Refresh the summary table
+   2. Rewrite section 8.8
+   3. Type something.
+──────
+   4. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+NUMBERED_QUESTION_FIELD = NUMBERED_QUESTION_REAL.replace(
+    "Enter to select · ↑/↓ to navigate · Esc to cancel",
+    "Enter to select · ↑/↓ to navigate · ctrl+g to edit in Nvim · Esc to cancel",
+)
+
+
+class NumberedQuestionFreeTextTests(unittest.TestCase):
+    """A plain sentence must answer a single-select question menu via its
+    'Type something.' row -- this used to be refused as 'free-text response
+    requires a detected question' because only omp-style/checkbox menus had a
+    free-text delivery path."""
+
+    def test_a_plain_markdown_list_is_not_a_question_menu(self):
+        # Same 1..5 shape as the live refusal, but document content: no
+        # "Type something." row and no menu footer. Must stay None.
+        doc = "\n".join(f"{i}. step {i}" for i in range(1, 6)) + "\n\nSome prose.\n"
+        with loaded_relay() as relay:
+            self.assertIsNone(relay.detect_numbered_question_menu(doc))
+            self.assertEqual(relay.numbered_question_free_text_index(
+                relay.detect_numbered_options(doc)), None)
+
+    def test_an_approval_menu_has_no_free_text_row(self):
+        with loaded_relay() as relay:
+            self.assertIsNone(relay.detect_numbered_question_menu(CLAUDE_MENU))
+
+    def test_real_question_menu_is_detected_with_its_free_text_row(self):
+        with loaded_relay() as relay:
+            found = relay.detect_numbered_question_menu(NUMBERED_QUESTION_REAL)
+            self.assertIsNotNone(found)
+            options, free_index = found
+            self.assertEqual(len(options), 4)
+            self.assertEqual(free_index, 3)
+
+    def test_footer_is_required_even_with_a_type_something_label(self):
+        # A list that happens to end "3. Type something." but is not an
+        # interactive menu (no navigation footer) must not be driven.
+        fake = "Plan:\n1. do a\n2. do b\n3. Type something.\n4. Chat about this\n"
+        with loaded_relay() as relay:
+            self.assertIsNone(relay.detect_numbered_question_menu(fake))
+
+    def test_delivery_walks_to_the_row_waits_for_field_and_submits(self):
+        with loaded_relay() as relay:
+            screens = iter([NUMBERED_QUESTION_REAL, NUMBERED_QUESTION_FIELD])
+            with mock.patch.object(relay, "question_screen",
+                                   return_value=NUMBERED_QUESTION_REAL), \
+                 mock.patch.object(relay, "read_pane",
+                                   side_effect=lambda *a, **k: next(screens)), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True) as mutate, \
+                 mock.patch.object(relay.time, "sleep"):
+                ok = relay.deliver_numbered_free_text(
+                    "pane-1", "更新飞书文档", 3, remote=None)
+            self.assertTrue(ok)
+            # First call walks Down Down (cursor row 1 -> 3) + Enter to open the
+            # field; then the typed answer; then Enter submits.
+            calls = [c.args[2:] for c in mutate.call_args_list]
+            # (pane_id, keys...) per call: walk Down Down + Enter, then text, then Enter.
+            self.assertEqual(calls[0][1:], ("Down", "Down", "Enter"))
+            self.assertEqual(calls[1][1], "更新飞书文档")
+            self.assertEqual(calls[2][1], "Enter")
+
+    def test_delivery_fails_when_the_field_never_opens(self):
+        with loaded_relay() as relay:
+            with mock.patch.object(relay, "question_screen",
+                                   return_value=NUMBERED_QUESTION_REAL), \
+                 mock.patch.object(relay, "read_pane",
+                                   return_value=NUMBERED_QUESTION_REAL), \
+                 mock.patch.object(relay, "_mutate_herdr", return_value=True), \
+                 mock.patch.object(relay.time, "sleep"):
+                self.assertFalse(relay.deliver_numbered_free_text(
+                    "pane-1", "hi", 3, remote=None))
+
+
 
 class GeminiNumberedMenuTests(unittest.TestCase):
     """gemini-cli marks the selected option with `●` and often draws the menu inside a box, so
