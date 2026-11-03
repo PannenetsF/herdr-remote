@@ -573,22 +573,32 @@ READ_VIEW_MAX = 3500
 
 
 async def show_pane_view(bot, chat_id: int, message, pane_id: str, header: str,
-                         content: str, footer: str | None = None):
-    """One live-view message per pane, edited in place on every read.
+                         content: str, footer: str | None = None, reuse: bool = False):
+    """Render a pane's transcript-preview message.
 
-    Repeated /read of the same agent used to post a fresh message each time, so a few commands
-    buried the chat in output to scroll past. Editing the previous view instead keeps one message
-    that refreshes -- closer to watching a terminal than reading a log. content arrives as
-    pre-capped, balanced Telegram HTML (rendered transcript, or a <pre> raw-capture fallback),
-    so it must never be tail-sliced here. Falls back to a new message if the old
-    one is gone (deleted, or too old for Telegram to edit).
+    Two modes, because "I opened a session" and "refresh the view I'm looking
+    at" are different gestures:
+
+    * reuse=False (every explicit open -- a /switch or /project pick, a bottom-
+      bar 🔄 recent tap, a Read button): ALWAYS post a fresh message at the
+      chat bottom and retrack it. Editing a pane's old preview wherever it
+      sat in history looked like a dead button -- the tap changed nothing
+      visible and the new content was silently rewritten into a scrolled-away
+      message. That was pf.18's measured bug.
+    * reuse=True (the 🎯 current-pane bar key only): edit this pane's tracked
+      preview in place when it still exists, falling back to a new message.
+      That key is an explicit "refresh what I'm viewing", never navigation.
+
+    content arrives as pre-capped, balanced Telegram HTML (rendered
+    transcript, or a <pre> raw-capture fallback), so it must never be
+    tail-sliced here.
     """
     text = f"<b>{_html_escape(header)}</b>\n{content}"
     if footer:
         text += f"\n\n<i>{_html_escape(footer)}</i>"
     key = (int(chat_id), pane_id)
     existing = read_views.get(key)
-    if existing is not None:
+    if reuse and existing is not None:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=existing, text=text,
                                         parse_mode="HTML")
@@ -1527,25 +1537,27 @@ def build_switch_keyboard(page: int = 0, statusf: str = "all", query: str = "") 
 
 
 FOCUS_VIEW_FOOTER = (
-    "已聚焦：直接输入消息即发送到该 session，不需要 reply；再点一次该 session 可刷新预览。"
+    "已聚焦：直接输入消息即发送到该 session，不需要 reply；点底部栏 🎯 原地刷新此预览，"
+    "重新选择该 session 会在底部弹出新预览。"
 )
 
 
-async def send_focus_view(bot, message, chat, rec: dict):
-    """Focus a pane and open its one reusable transcript-preview message.
+async def send_focus_view(bot, message, chat, rec: dict, reuse: bool = False):
+    """Focus a pane and open its transcript-preview message.
 
     pf.6: picking a session from /switch or the bottom bar used to post only a
     "已聚焦" one-liner, so the conversation preview was an extra 📖 Read tap away.
-    Selection now renders the same transcript view as Read; repeated picks of the
-    same pane edit that message in place (see show_pane_view) instead of
-    burying the chat.
+    Selection now renders the same transcript view as Read. pf.18: a PICK
+    always posts a fresh message at the bottom (reuse=False) -- editing an old
+    buried preview read as a dead button; only the 🎯 current-pane bar key
+    asks for an in-place refresh (reuse=True).
     """
     pane_id = rec["pane_id"]
     header = f"🎯 {pane_focus_identity(rec)} · 已聚焦"
     content, _is_raw = await read_agent(pane_id)
     return await show_pane_view(
         bot, chat.id, message, pane_id, header, content,
-        footer=FOCUS_VIEW_FOOTER,
+        footer=FOCUS_VIEW_FOOTER, reuse=reuse,
     )
 
 
@@ -2037,8 +2049,10 @@ async def cmd_read(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     content, _is_raw = await read_agent(match["pane_id"])
+    # /read is an explicit refresh command: reuse the tracked message for the
+    # pane instead of stacking a new one (contrast with a picker tap, pf.18).
     await show_pane_view(ctx.bot, update.effective_chat.id, update.message,
-                         match["pane_id"], agent_identity(match), content)
+                         match["pane_id"], agent_identity(match), content, reuse=True)
 
 
 async def cmd_interrupt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2601,8 +2615,10 @@ async def handle_bar_tap(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             unfocus_pane()
             return
         # Same preview surface as picking from /switch, without changing focus.
+        # This is the one in-place refresh gesture: reuse the tracked message
+        # instead of posting a new one (pf.18).
         await send_focus_view(
-            getattr(ctx, "bot", None), message, update.effective_chat, rec
+            getattr(ctx, "bot", None), message, update.effective_chat, rec, reuse=True
         )
 
 

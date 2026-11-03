@@ -342,7 +342,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.agents = make_agents(1, project="api-v2.0")   # specials must not break MarkdownV2
         update = make_update()
         ctx = make_context(args=["api"])
-        with patch.object(tg, "read_pane", AsyncMock(side_effect=["first out", "second out"])):
+        with patch.object(tg, "read_agent", AsyncMock(side_effect=[("first out", True),
+                                                                   ("second out", True)])):
             await tg.cmd_read(update, ctx)   # posts the view
             await tg.cmd_read(update, ctx)   # edits it
 
@@ -357,7 +358,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.agents = make_agents(1)
         update = make_update()
         ctx = make_context(args=["project"], bot=FakeBot(not_modified=True))
-        with patch.object(tg, "read_pane", AsyncMock(side_effect=["same", "same"])):
+        with patch.object(tg, "read_agent", AsyncMock(side_effect=[("same", True),
+                                                                     ("same", True)])):
             await tg.cmd_read(update, ctx)
             await tg.cmd_read(update, ctx)
 
@@ -368,7 +370,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         tg.agents = make_agents(1)
         update = make_update()
         ctx = make_context(args=["project"], bot=FakeBot(fail=True))
-        with patch.object(tg, "read_pane", AsyncMock(side_effect=["one", "two"])):
+        with patch.object(tg, "read_agent", AsyncMock(side_effect=[("one", True),
+                                                                   ("two", True)])):
             await tg.cmd_read(update, ctx)
             await tg.cmd_read(update, ctx)
 
@@ -381,7 +384,8 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         reply_update = make_update()
 
         with (
-            patch.object(tg, "read_pane", AsyncMock(side_effect=["read output", "reply output"])),
+            patch.object(tg, "read_agent", AsyncMock(side_effect=[("read output", True),
+                                                                  ("reply output", True)])),
             patch.object(tg, "send_text_to_relay", AsyncMock()) as send_text,
         ):
             await tg.cmd_read(read_update, make_context(args=["project"]))
@@ -1710,7 +1714,11 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
             await tg.handle_text(make_update(message=follow), make_context(bot=FakeBot()))
         send_text.assert_awaited_once_with("wT:pA", "do the thing")
 
-    async def test_reselect_same_pane_edits_preview_in_place(self):
+    async def test_reselect_same_pane_posts_fresh_preview_at_bottom(self):
+        # pf.18: an in-place edit of a scrolled-away preview read as a dead
+        # button (the B200 report). Re-picking a session must always post a
+        # fresh view at the chat bottom and retrack it; the old message stays
+        # untouched.
         self._herd()
         bot = FakeBot()
         button = tg.build_switch_keyboard().inline_keyboard
@@ -1725,11 +1733,37 @@ class FocusAndBarTests(unittest.IsolatedAsyncioTestCase):
             second = FakeCallback(target.callback_data)
             await tg.handle_callback(make_update(callback=second), make_context(bot=bot))
         self.assertEqual(preview.await_count, 2)
-        # One new view message, then an in-place edit -- no second card in the chat.
+        # Both taps post a new view at the bottom; nothing is edited in place.
         self.assertEqual(len(first.message.replies), 1)
-        self.assertEqual(len(second.message.replies), 0)
-        self.assertTrue(any("已聚焦" in text and "预览" in text
-                            for _c, _mid, text, _k in bot.edits))
+        self.assertEqual(len(second.message.replies), 1)
+        self.assertEqual(bot.edits, [])
+        # The tracked preview points at the newest message.
+        self.assertEqual(tg.read_views[(42, "wT:pA")],
+                         second.message.replies[0][2].message_id)
+
+    async def test_active_bar_key_still_refreshes_preview_in_place(self):
+        # The ONE in-place refresh gesture: the 🎯 current-pane bar key edits
+        # the tracked preview rather than posting another card.
+        self._herd()
+        bot = FakeBot()
+        button = tg.build_switch_keyboard().inline_keyboard
+        pane_buttons = [row[0] for row in button
+                        if tg.parse_callback_data(row[0].callback_data).get("action") == "switch"]
+        target = next(b for b in pane_buttons
+                      if tg.parse_callback_data(b.callback_data)["pane_id"] == "wT:pA")
+        with patch.object(tg, "read_agent",
+                          AsyncMock(return_value=("<b>agent</b>\n预览", False))):
+            picked = FakeCallback(target.callback_data)
+            await tg.handle_callback(make_update(callback=picked), make_context(bot=bot))
+
+        active_label = tg.build_bar_markup().keyboard[0][0].text
+        tap = FakeMessage()
+        tap.text = active_label
+        with patch.object(tg, "read_agent",
+                          AsyncMock(return_value=("<b>agent</b>\n刷新", False))):
+            await tg.handle_text(make_update(message=tap), make_context(bot=bot))
+        self.assertEqual(len(tap.replies), 0)
+        self.assertTrue(any("刷新" in text for _c, _mid, text, _k in bot.edits))
 
     def test_switch_keyboard_groups_and_filters(self):
         self._herd()
