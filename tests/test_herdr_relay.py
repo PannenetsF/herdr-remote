@@ -4667,6 +4667,13 @@ class RelayIdAllowlistTests(unittest.TestCase):
                 with self.subTest(path=path):
                     self.assertEqual(self._token_push(relay, path).status_code, 401)
 
+    def test_a_websocket_upgrade_carrying_d_still_needs_the_token(self):
+        """With a token set the origin check is skipped, so this would be a token-free session."""
+        path = "/?d=" + urllib.parse.quote(json.dumps({"type": "agent_event"}))
+        upgrade = (("Upgrade", "websocket"), ("Connection", "Upgrade"))
+        with loaded_relay(relay_token="s3cret") as relay:
+            self.assertEqual(self._token_push(relay, path, headers=upgrade).status_code, 401)
+
     def test_a_hostile_id_over_the_websocket_is_dropped(self):
         with loaded_relay() as relay:
             hostile = {"type": "agent_event", "pane_id": self.QUOTE_BREAKOUT, "agent": "claude",

@@ -3249,7 +3249,9 @@ def local_event_push(connection, request):
     if host not in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}:
         return False
     for key, _ in request.headers.raw_items():
-        if key.lower() in _PROXY_HEADERS:
+        # An upgrade is never a push. With a token set the origin check is skipped, so letting
+        # `/?d=` open a WebSocket would hand any local page a token-free session.
+        if key.lower() in _PROXY_HEADERS or key.lower() == "upgrade":
             return False
     return True
 
