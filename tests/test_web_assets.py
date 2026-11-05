@@ -134,7 +134,8 @@ class WebAssetAuthTests(unittest.TestCase):
         # The exemption is written as an extra condition on the auth branch, so it can only ever
         # widen to what web_asset resolves -- and web_asset refuses index.html.
         self.assertIn(
-            "if AUTH_TOKEN and request_path not in public_paths and web_asset(request_path) is None:",
+            "if (AUTH_TOKEN and request_path not in public_paths and web_asset(request_path) is None\n"
+            "            and not local_event_push(connection, request)):",
             source)
 
 

@@ -4624,6 +4624,49 @@ class RelayIdAllowlistTests(unittest.TestCase):
             self.assertEqual(relay.event_queue.qsize(), 1)
             self.assertEqual(relay.event_queue.get_nowait()["pane_id"], "pane-7")
 
+    def _token_push(self, relay, path, *, peer=("127.0.0.1", 51000), headers=()):
+        request = types.SimpleNamespace(path=path,
+                                        headers=types.SimpleNamespace(raw_items=lambda: headers))
+        connection = types.SimpleNamespace(remote_address=peer)
+        with mock.patch.dict(sys.modules, _http_stubs(), clear=False):
+            return asyncio.run(relay.process_request(connection, request))
+
+    def test_a_loopback_push_needs_no_token(self):
+        """herdr-push is plain curl: with a relay token set it must still reach the queue."""
+        event = {"type": "agent_event", "pane_id": "pane-7", "agent": "claude",
+                 "status": "blocked", "cwd": "/work/api", "project": "api"}
+        path = "/push?d=" + urllib.parse.quote(json.dumps(event))
+        with loaded_relay(relay_token="s3cret") as relay:
+            for peer in (("127.0.0.1", 51000), ("::1", 51000, 0, 0)):
+                with self.subTest(peer=peer[0]):
+                    self.assertEqual(self._token_push(relay, path, peer=peer).status_code, 200)
+                    self.assertEqual(relay.event_queue.get_nowait()["pane_id"], "pane-7")
+
+    def test_a_proxied_or_remote_push_still_needs_the_token(self):
+        event = {"type": "agent_event", "pane_id": "pane-7", "agent": "claude",
+                 "status": "blocked", "cwd": "/work/api", "project": "api"}
+        path = "/?d=" + urllib.parse.quote(json.dumps(event))
+        with loaded_relay(relay_token="s3cret") as relay:
+            cases = {
+                "remote peer": dict(peer=("192.168.1.9", 51000)),
+                "no peer": dict(peer=None),
+                "tunnelled via proxy": dict(headers=(("X-Forwarded-For", "10.0.0.5"),)),
+                "proxy with Via": dict(headers=(("Via", "1.1 caddy"),)),
+            }
+            for name, kwargs in cases.items():
+                with self.subTest(case=name):
+                    self.assertEqual(self._token_push(relay, path, **kwargs).status_code, 401)
+            self.assertEqual(relay.event_queue.qsize(), 0)
+            authed = (("Authorization", "Bearer s3cret"), ("X-Forwarded-For", "10.0.0.5"))
+            self.assertEqual(self._token_push(relay, path, headers=authed).status_code, 200)
+            self.assertEqual(relay.event_queue.qsize(), 1)
+
+    def test_the_loopback_exemption_covers_only_event_pushes(self):
+        with loaded_relay(relay_token="s3cret") as relay:
+            for path in ("/", "/api/spaces", "/?token=nope", "/?x=1"):
+                with self.subTest(path=path):
+                    self.assertEqual(self._token_push(relay, path).status_code, 401)
+
     def test_a_hostile_id_over_the_websocket_is_dropped(self):
         with loaded_relay() as relay:
             hostile = {"type": "agent_event", "pane_id": self.QUOTE_BREAKOUT, "agent": "claude",

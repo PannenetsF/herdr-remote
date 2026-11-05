@@ -3225,6 +3225,35 @@ def web_asset(request_path):
     return resolved, content_type, cache_control
 
 
+_PROXY_HEADERS = {"x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "forwarded", "via",
+                  "x-real-ip"}
+
+
+def local_event_push(connection, request):
+    """True for an event push (`?d=`) sent straight to this port from this host.
+
+    herdr-push's on_event.sh is plain curl with no way to carry the relay token, so with
+    HERDR_RELAY_TOKEN set every push 401'd and blocked/done fell back to the poll. UDP 8376 is
+    already token-free on 127.0.0.1, so a loopback HTTP push widens nothing. A request relayed
+    by a reverse proxy also arrives from loopback (an ssh -R tunnel ends here), so any proxy
+    header disqualifies it: those callers keep needing the token.
+    """
+    path = request.path or ""
+    if "?" not in path:
+        return False
+    import urllib.parse
+    if "d" not in urllib.parse.parse_qs(path.split("?", 1)[1]):
+        return False
+    peer = getattr(connection, "remote_address", None)
+    host = peer[0] if peer else ""
+    if host not in {"127.0.0.1", "::1", "::ffff:127.0.0.1"}:
+        return False
+    for key, _ in request.headers.raw_items():
+        if key.lower() in _PROXY_HEADERS:
+            return False
+    return True
+
+
 async def process_request(connection, request):
     """Handle HTTP POST on the same port as WebSocket."""
     from websockets.http11 import Response
@@ -3237,7 +3266,9 @@ async def process_request(connection, request):
     # the stylesheet, the scripts and the fonts before anything has authenticated, and the
     # service worker reads its notification icon with no session at all. index.html is NOT one of
     # them -- see web_asset -- so the app itself stays behind the token exactly as before.
-    if AUTH_TOKEN and request_path not in public_paths and web_asset(request_path) is None:
+    # A direct loopback event push is exempt too (see local_event_push).
+    if (AUTH_TOKEN and request_path not in public_paths and web_asset(request_path) is None
+            and not local_event_push(connection, request)):
         token = None
         for key, value in request.headers.raw_items():
             if key.lower() == "authorization":
