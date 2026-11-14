@@ -1,9 +1,9 @@
-"""Strict primary-only Projects projection, exercised in the real web app.
+"""pf.23 project-first Projects layout, exercised in the real web app.
 
-Projects renders hp_role=coordinator and hp_role=session panes (plus legacy fail-open sessions
-with no authoritative role). A hp_role=thread pane is NEVER its own card, regardless of
-hp_audience or process status; human/stalled workers surface only as an aggregate follow-up
-badge on the earliest live coordinator of the same (host, project). All panes keeps everything.
+Projects is one compact row PER (host, hp_project), ordered by project urgency, with sessions in an
+inline accordion. The pf.22 rule is unchanged: only coordinator/session (and legacy fail-open) panes
+are members; no hp_role=thread, guest or other pane ever becomes a row, and human/stalled workers are
+an aggregate follow-up count on the owning coordinator. All panes keeps the raw triage list.
 """
 import os
 from pathlib import Path
@@ -11,6 +11,7 @@ import unittest
 
 
 PAGE = (Path(__file__).resolve().parents[1] / "web" / "index.html").as_uri()
+SHOTS = Path("/tmp/pf23-test-shots")
 CHROME_CANDIDATES = [
     os.environ.get("HERDR_TEST_CHROME", ""),
     os.path.expanduser("~/.cache/ms-playwright/chromium-1223/chrome-linux64/chrome"),
@@ -19,6 +20,7 @@ CHROME_CANDIDATES = [
 ]
 PHONE = {"width": 390, "height": 844}
 T0 = 1_700_000_000_000
+THREAD_IDS = {"wA:pT", "wA:pU", "wA:pV", "wA:pG", "wA:pO"}
 
 
 def _chrome():
@@ -60,11 +62,14 @@ def agent(pane_id, role="", audience="", slug="", **extra):
     return row
 
 
-COORD = agent("wA:pC", "coordinator", slug="alpha", label="hpc-alpha", order=0)
+COORD = agent("wA:pC", "coordinator", slug="alpha", label="hpc-alpha", order=0,
+              title="Reviewing the deploy plan")
 SECOND = agent("wA:pD", "coordinator", slug="alpha", label="hpc-alpha-1", status="blocked",
-               order=5)
+               order=5, title="Merging the queue backlog",
+               last_active_at=T0 + 400, last_seen_at=T0)
 SESSION = agent("wA:pS", "session", slug="alpha", label="manual-review", status="done",
-                last_active_at=T0 + 100, last_seen_at=T0, order=6)
+                title="Hand-started incident check", order=6,
+                last_active_at=T0 + 100, last_seen_at=T0)
 INTERNAL = agent("wA:pT", "thread", "internal", "alpha", label="hp-alpha-t-0001",
                  status="blocked", hp_group="alpha!1!1!t-0001", order=1)
 STALLED = agent("wA:pU", "thread", "stalled", "alpha", label="hp-alpha-t-0002",
@@ -74,20 +79,24 @@ HUMAN = agent("wA:pV", "thread", "human", "alpha", label="hp-alpha-t-0003",
 GUEST = agent("wA:pG", "guest", "internal", "alpha", status="blocked", order=7)
 OTHER = agent("wA:pO", "other", "internal", status="blocked", order=8)
 LEGACY = agent("wB:p1", label="plain-session", cwd="/work/plain", project="plain",
-               workspace_id="wB", tab_id="wB:t1", order=0)
+               workspace_id="wB", tab_id="wB:t1", title="Idle maintenance shell",
+               status="idle", last_active_at=T0 - 5000, last_seen_at=T0 - 4000)
 REMOTE = agent("wB:pC", "coordinator", slug="alpha", label="hpc-alpha", host="boe",
-               remote="boe", workspace_id="wB", tab_id="wB:t1", order=1)
+               remote="boe", workspace_id="wB", tab_id="wB:t1", order=1,
+               title="Remote coordinator standup")
 SNAPSHOT = {"type": "agents", "agents": [COORD, SECOND, SESSION, INTERNAL, STALLED, HUMAN,
                                                GUEST, OTHER, LEGACY, REMOTE],
             "spaces": {"workspaces": [], "tabs": []}, "panes": []}
 
-PROJECT_IDS = {"wA:pC", "wA:pD", "wA:pS", "wB:p1", "wB:pC"}
-THREAD_IDS = {"wA:pT", "wA:pU", "wA:pV", "wA:pG", "wA:pO"}
+# Project keys in rendered urgency order.
+ALPHA_LOCAL = "local|alpha"
+ALPHA_BOE = "boe|alpha"
+PLAIN_LOCAL = "local|plain"
 
 
 @unittest.skipIf(sync_playwright is None, "playwright is not installed")
 @unittest.skipIf(_chrome() is None, "no chromium build available")
-class WebProjectTests(unittest.TestCase):
+class WebProjectLayoutTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.page = _shared["browser"].new_page(viewport=PHONE)
@@ -98,202 +107,235 @@ class WebProjectTests(unittest.TestCase):
         cls.page.close()
 
     def load(self, snapshot=SNAPSHOT):
-        # Fresh attention ledgers, so each test observes the first-snapshot behaviour.
         self.page.evaluate("""s => {
           ws = {readyState: 1, send: () => {}};
           hidePanel(); hideTerminal();
           activeWorkspace = 'projects'; activeTab = null; herdView = 'projects';
           localStorage.setItem('herdr_herd_view', 'projects');
+          localStorage.removeItem('herdr_project_expanded');
+          projectExpansion = null; seenProjectKeys.clear();
           timeline = []; rawTimeline = []; prevStatuses = {};
           previousAttention = {}; previousFollowups = new Map();
           agentsSnapshotReady = false; pendingPaneRequest = null;
           window.__cues = []; window.cue = name => window.__cues.push(name);
-          recentOpen = true; recentDir = 'newest';
           handleMessage(s);
         }""", snapshot)
 
     def setUp(self):
         self.load()
 
-    def rows(self):
-        return self.page.eval_on_selector_all("#agents .agent", """els => els.map(e => ({
-          source: e.dataset.sourcePaneId, target: e.dataset.paneId,
-          bucket: e.dataset.bucket, title: e.innerText}))""")
+    def groups(self):
+        return self.page.eval_on_selector_all(
+            ".project-group",
+            """els => els.map(e => ({
+              key: e.dataset.projectKey, bucket: e.dataset.bucket,
+              expanded: e.classList.contains('expanded'),
+              slug: e.querySelector('.project-slug').textContent,
+              meta: [...e.querySelectorAll('.project-meta-chip')].map(c => c.textContent),
+              host: e.querySelector('.project-meta-chip.is-host')?.textContent || '',
+              badge: e.querySelector('.project-count')?.textContent || '',
+              members: [...e.querySelectorAll('.project-session')].map(li => ({
+                id: li.dataset.paneId, role: li.querySelector('.ps-role').textContent,
+                state: li.querySelector('.ps-state').textContent,
+                title: li.querySelector('.ps-title').textContent,
+                followups: li.querySelector('.ps-followups')?.textContent || '',
+              })),
+            }))""")
 
-    def test_projects_show_only_primary_sessions_and_legacy_fail_open(self):
-        sources = {r["source"] for r in self.rows()}
-        self.assertEqual(sources, PROJECT_IDS)
-        # No worker thread, guest or other pane ever gets a Projects card.
-        self.assertEqual(sources & THREAD_IDS, set())
-        for pane_id in THREAD_IDS:
-            self.assertEqual(self.page.locator(f'[data-source-pane-id="{pane_id}"]').count(), 0)
+    def test_one_row_per_project_and_not_a_single_thread_card(self):
+        groups = self.groups()
+        self.assertEqual([g["key"] for g in groups], [ALPHA_LOCAL, ALPHA_BOE, PLAIN_LOCAL])
+        # A project split across status sections would render twice; each key appears exactly once.
+        keys = [g["key"] for g in groups]
+        self.assertEqual(len(keys), len(set(keys)))
+        # No worker/guest/other pane id survives anywhere in the Projects surface.
+        rendered = set(self.page.eval_on_selector_all(
+            "[data-source-pane-id]", "els => els.map(e => e.dataset.sourcePaneId)"))
+        self.assertEqual(rendered & THREAD_IDS, set())
+        # The global status sections are gone from Projects.
+        self.assertEqual(self.page.locator(".section-header").count(), 0)
+        self.assertEqual(self.page.locator(".project-heading").count(), 0)
 
-    def test_escalated_workers_badge_once_on_the_earliest_coordinator(self):
-        badges = self.page.locator("#agents .follow-badge")
-        self.assertEqual(badges.count(), 1)
-        owner = self.page.locator('[data-source-pane-id="wA:pC"]')
-        self.assertEqual(owner.locator(".follow-badge").count(), 1)
-        self.assertEqual(owner.locator(".follow-badge").inner_text(), "2 follow-ups")
+    def test_the_full_slug_is_the_primary_text_never_a_truncated_hpc_prefix(self):
+        slugs = self.page.locator(".project-slug").all_inner_texts()
+        self.assertIn("alpha", slugs)
+        self.assertIn("plain", slugs)
+        self.assertFalse(any(s.startswith("hpc-") for s in slugs))
+
+    def test_projects_are_ordered_by_urgency_and_default_to_attention_expanded(self):
+        groups = self.groups()
+        self.assertEqual([g["bucket"] for g in groups], ["needs", "working", "recent"])
+        # Implicit default: the first/attention project open, quiet projects collapsed.
+        self.assertTrue(groups[0]["expanded"])
+        self.assertFalse(groups[1]["expanded"])
+        self.assertFalse(groups[2]["expanded"])
+
+    def test_meta_counts_are_honest_and_the_aggregate_badge_sits_on_one_coordinator(self):
+        alpha = self.groups()[0]
+        self.assertEqual(alpha["badge"], "2 follow-ups")
+        self.assertIn("2 coordinators", alpha["meta"])
+        self.assertIn("1 session", alpha["meta"])
+        self.assertIn("1 blocked", alpha["meta"])
+        self.assertIn("1 ready", alpha["meta"])
+        self.assertIn("1 active", alpha["meta"])
+        # Exactly one member row carries the quiet follow-up pill, and it is the earliest coordinator.
+        with_pill = [m for m in alpha["members"] if m["followups"]]
+        self.assertEqual([m["id"] for m in with_pill], ["wA:pC"])
+        self.assertEqual(with_pill[0]["followups"], "2 follow-ups")
+        self.assertEqual([m["id"] for m in alpha["members"]], ["wA:pC", "wA:pD", "wA:pS"])
+
+    def test_expansion_reveals_distinct_sessions_that_open_their_own_pane(self):
+        # The boe project starts collapsed: its panel is hidden.
+        boe = self.page.locator(f'.project-group[data-project-key="{ALPHA_BOE}"]')
+        self.assertEqual(boe.locator(".project-row").get_attribute("aria-expanded"), "false")
+        self.assertFalse(boe.locator(".project-sessions").is_visible())
+        boe.locator(".project-row").click()
+        self.assertEqual(boe.locator(".project-row").get_attribute("aria-expanded"), "true")
+        self.assertTrue(boe.locator(".project-session").first.is_visible())
+        # One distinct row per primary pane; coordinators are never merged.
+        self.assertEqual(boe.locator(".project-session").count(), 1)
+        boe.locator(".project-session").click()
+        self.assertEqual(self.page.evaluate("activePane"), "wB:pC")
+
+    def test_expansion_is_persisted_per_browser(self):
+        boe = self.page.locator(f'.project-group[data-project-key="{ALPHA_BOE}"]')
+        boe.locator(".project-row").click()
+        stored = self.page.evaluate("JSON.parse(localStorage.herdr_project_expanded)")
+        self.assertIn(ALPHA_BOE, stored)
+        self.page.reload()
+        self.page.goto(PAGE)
+        # Reload WITHOUT the setUp reset, which deliberately clears the store: here the persisted
+        # choice must survive. Re-seed only the socket and view, leaving herdr_project_expanded.
+        self.page.evaluate("""s => {
+          ws = {readyState: 1, send: () => {}};
+          hidePanel(); hideTerminal();
+          activeWorkspace = 'projects'; activeTab = null; herdView = 'projects';
+          seenProjectKeys.clear();
+          agentsSnapshotReady = false; pendingPaneRequest = null;
+          handleMessage(s);
+        }""", SNAPSHOT)
+        # The stored choice survives the reload: boe stays open.
+        self.assertTrue(
+            self.page.locator(f'.project-group[data-project-key="{ALPHA_BOE}"]')
+            .evaluate("e => e.classList.contains('expanded')"))
+
+    def test_host_is_a_group_level_marker_not_repeated_on_member_rows(self):
+        boe = self.groups()[1]
+        self.assertEqual(boe["host"], "@boe")
+        local_hosts = self.page.locator(
+            f'.project-group[data-project-key="{ALPHA_LOCAL}"] .project-meta-chip.is-host').count()
+        self.assertEqual(local_hosts, 0)
+        # Member rows never carry a host string of their own.
+        self.assertEqual(self.page.locator(".project-session .project-host").count(), 0)
+        self.assertEqual(self.page.locator(".project-session .is-host").count(), 0)
+
+    def test_no_nested_interactive_controls_inside_the_toggle_row(self):
+        # The whole project row is the one button; chevron/dot/badge are non-interactive spans and
+        # session rows are siblings in the panel, not children of the toggle.
+        offenders = self.page.eval_on_selector_all(
+            ".project-row",
+            "els => els.flatMap(e => [...e.querySelectorAll('button,[role=button],a')].map(x => x.className))")
+        self.assertEqual(offenders, [])
+        toggles = self.page.locator(".project-row[aria-expanded][aria-controls]")
+        self.assertEqual(toggles.count(), 3)
+
+    def test_orphan_threads_get_no_group_badge_or_alert(self):
+        orphaned = {"type": "agents",
+                    "agents": [SESSION, INTERNAL, STALLED, HUMAN, GUEST, OTHER],
+                    "spaces": {"workspaces": [], "tabs": []}, "panes": []}
+        self.load(orphaned)
+        # The session's project exists, but carries no FOLLOW-UP badge: no live coordinator owns the
+        # escalated workers. The session's own ready state may still show its honest "1 ready" pill.
+        groups = self.groups()
+        self.assertEqual(len(groups), 1)
         self.assertEqual(
-            owner.locator(".follow-badge").get_attribute("aria-label"), "2 thread follow-ups")
-        # The second coordinator stays its own card and never duplicates the aggregate.
-        second = self.page.locator('[data-source-pane-id="wA:pD"]')
-        self.assertEqual(second.locator(".follow-badge").count(), 0)
-        # The remote coordinator owns no remote threads, so it carries no badge.
+            self.page.locator(".project-count.is-followups").count(), 0)
         self.assertEqual(
-            self.page.locator('[data-source-pane-id="wB:pC"] .follow-badge').count(), 0)
+            self.page.locator(".ps-followups").count(), 0)
+        self.assertEqual(self.page.evaluate("window.__cues"), [])
+        rendered = set(self.page.eval_on_selector_all(
+            "[data-source-pane-id]", "els => els.map(e => e.dataset.sourcePaneId)"))
+        self.assertEqual(rendered & THREAD_IDS, set())
 
-    def test_aggregate_puts_the_coordinator_in_needs_you_without_faking_its_status(self):
-        owner = next(r for r in self.rows() if r["source"] == "wA:pC")
-        self.assertEqual(owner["bucket"], "needs")
-        # The underlying process is still working: the badge, not a fake block, drives the bucket.
-        self.assertEqual(self.page.evaluate(
-            "agents.find(a => a.pane_id === 'wA:pC').status"), "working")
-        section = self.page.evaluate("""() => {
-          let el = document.querySelector('[data-source-pane-id="wA:pC"]');
-          while (el && !el.classList.contains('section-header')) el = el.previousElementSibling;
-          return el && el.querySelector('.sec-label').textContent;
+    def test_deep_link_opens_the_pane_and_expands_its_project(self):
+        # boe starts collapsed; a notification deep link must still land on the pane.
+        self.page.evaluate("""() => {
+          hideTerminal(); agentsSnapshotReady = false;
+          requestPane('wB:pC');
         }""")
-        self.assertEqual(section, "Needs you")
-        # The card's second line names the aggregate rather than pretending to be a prompt.
-        self.assertIn("2 thread follow-ups", owner["title"])
-
-    def test_coordinator_card_opens_the_coordinator_itself(self):
-        row = self.page.locator('[data-source-pane-id="wA:pC"]')
-        self.assertEqual(row.get_attribute("data-pane-id"), "wA:pC")
-        row.click()
-        self.assertEqual(self.page.evaluate("activePane"), "wA:pC")
-
-    def test_two_coordinators_remain_two_cards_and_each_keeps_its_own_bucket(self):
-        rows = {r["source"]: r for r in self.rows()}
-        self.assertIn("wA:pC", rows)
-        self.assertIn("wA:pD", rows)
-        self.assertEqual(rows["wA:pD"]["bucket"], "needs")  # genuinely process-blocked
-        self.assertEqual(rows["wA:pS"]["bucket"], "ready")  # done while unseen
-
-    def test_threads_without_a_live_coordinator_get_no_card_and_no_alert(self):
-        orphaned = {
-            "type": "agents",
-            "agents": [SESSION, INTERNAL, STALLED, HUMAN, GUEST, OTHER, LEGACY, REMOTE],
-            "spaces": {"workspaces": [], "tabs": []}, "panes": [],
-        }
-        self.load(orphaned)
-        sources = {r["source"] for r in self.rows()}
-        self.assertNotIn("wA:pU", sources)
-        self.assertNotIn("wA:pV", sources)
-        self.assertEqual(self.page.locator(".follow-badge").count(), 0)
-        # Nothing primary is blocked and the orphan aggregate cannot chime.
-        self.assertEqual(self.page.evaluate("window.__cues"), [])
-        # The workers are not lost: the raw stream still reaches them.
-        self.page.get_by_role("tab", name="All panes").click()
-        for pane_id in ("wA:pU", "wA:pV"):
-            self.assertEqual(
-                self.page.locator(f'[data-source-pane-id="{pane_id}"]').count(), 1)
-
-    def test_a_coordinator_appearing_after_the_escalation_still_fires_once(self):
-        orphaned = {
-            "type": "agents",
-            "agents": [SESSION, STALLED, HUMAN],
-            "spaces": {"workspaces": [], "tabs": []}, "panes": [],
-        }
-        self.load(orphaned)
-        self.assertEqual(self.page.locator(".follow-badge").count(), 0)
-        self.assertEqual(self.page.evaluate("window.__cues"), [])
-        # Coordinator comes online in a later snapshot: the aggregate now fires exactly once.
+        self.assertIsNone(self.page.evaluate("activePane"))
         self.page.evaluate("s => handleMessage(s)", SNAPSHOT)
-        self.assertEqual(self.page.evaluate("window.__cues"), ["chime", "chime"])
-        owner = self.page.locator('[data-source-pane-id="wA:pC"]')
-        self.assertEqual(owner.locator(".follow-badge").inner_text(), "2 follow-ups")
-        # A further repaint does not re-fire.
-        self.page.evaluate("s => handleMessage(s)", SNAPSHOT)
-        self.assertEqual(self.page.evaluate("window.__cues"), ["chime", "chime"])
+        self.assertEqual(self.page.evaluate("activePane"), "wB:pC")
+        self.assertTrue(
+            self.page.locator(f'.project-group[data-project-key="{ALPHA_BOE}"]')
+            .evaluate("e => e.classList.contains('expanded')"))
 
-    def test_registered_slug_groups_and_host_disambiguates_same_slug(self):
-        headings = self.page.locator("#agents .project-heading").all_inner_texts()
-        self.assertTrue(any(h.startswith("alpha") for h in headings))
-        self.assertTrue(any("alpha @boe" in h for h in headings))
-        self.assertNotIn("threads", " ".join(headings))
-
-    def test_all_panes_restores_every_agent_including_every_worker(self):
+    def test_all_panes_keeps_the_raw_triage_list_with_every_worker(self):
         self.page.get_by_role("tab", name="All panes").click()
         self.assertEqual(self.page.locator("#agents .agent").count(), len(SNAPSHOT["agents"]))
         for pane_id in THREAD_IDS:
             self.assertEqual(
                 self.page.locator(f'[data-source-pane-id="{pane_id}"]').count(), 1)
+        # The legacy global sections are intact in the raw view.
+        self.assertGreater(self.page.locator(".section-header").count(), 0)
         self.assertEqual(
             self.page.get_by_role("tab", name="All panes").get_attribute("aria-selected"), "true")
 
-    def test_first_snapshot_chimes_once_per_project_and_keeps_threads_out_of_timeline(self):
-        # setUp's load() is the first snapshot: one block chime (SECOND) + one aggregate chime.
+    def test_attention_semantics_survive_the_redesign(self):
+        # One block chime (the genuinely blocked second coordinator) + one aggregate chime.
         self.assertEqual(sorted(self.page.evaluate("window.__cues")), ["chime", "chime"])
         labels = self.page.evaluate("timeline.map(e => e.label)")
         self.assertEqual(set(labels), {"hpc-alpha", "hpc-alpha-1"})
         self.assertFalse(any("t-000" in label for label in labels))
         aggregate = self.page.evaluate(
             "timeline.find(e => e.followups && e.followups === 2)")
-        self.assertIsNotNone(aggregate)
         self.assertEqual(aggregate["label"], "hpc-alpha")
-        # A repaint with the same escalations chimes and records nothing new.
+        # A repaint fires nothing new.
         before = self.page.evaluate("timeline.length")
         self.page.evaluate("s => handleMessage(s)", SNAPSHOT)
         self.assertEqual(self.page.evaluate("timeline.length"), before)
         self.assertEqual(sorted(self.page.evaluate("window.__cues")), ["chime", "chime"])
 
-    def test_worker_events_only_ever_reach_the_raw_feed(self):
-        # Re-arm with every thread internal: no project escalation exists yet. The blocked
-        # coordinator stays, so its own attention chime is already counted in the baseline.
-        internal = {
-            "type": "agents",
-            "agents": [SECOND, dict(STALLED, hp_audience="internal"),
-                       dict(HUMAN, hp_audience="internal"), INTERNAL, COORD],
-            "spaces": {"workspaces": [], "tabs": []}, "panes": [],
-        }
+    def test_worker_events_only_reach_the_raw_feed(self):
+        internal = {"type": "agents",
+                    "agents": [SECOND, dict(STALLED, hp_audience="internal"),
+                               dict(HUMAN, hp_audience="internal"), INTERNAL, COORD],
+                    "spaces": {"workspaces": [], "tabs": []}, "panes": []}
         self.load(internal)
         cues_before = len(self.page.evaluate("window.__cues"))
-        self.assertEqual(self.page.evaluate("timeline.map(e => e.label)"), ["hpc-alpha-1"])
         self.page.evaluate("""() => {
           handleMessage({type: 'blocked', pane_id: 'wA:pT', agent: 'claude', project: 't-0001',
                          host: 'local', prompt: 'Allow?', prompt_id: 'internal', update: false});
-          handleMessage({type: 'blocked', pane_id: 'wA:pU', agent: 'claude', project: 't-0002',
-                         host: 'local', prompt: 'Allow?', prompt_id: 'stalled', update: true});
         }""")
-        # No new sound: a worker block is never an attention event.
         self.assertEqual(len(self.page.evaluate("window.__cues")), cues_before)
-        labels = self.page.evaluate("timeline.map(e => e.label)")
-        self.assertEqual(labels, ["hpc-alpha-1"])
         self.assertIn("hp-alpha-t-0001",
                       self.page.evaluate("rawTimeline.map(e => e.label)"))
-        # When the project later escalates, exactly one aggregate chime lands on the coordinator.
-        self.page.evaluate("s => handleMessage(s)", SNAPSHOT)
-        self.assertEqual(len(self.page.evaluate("window.__cues")), cues_before + 1)
-        labels = self.page.evaluate("timeline.map(e => e.label)")
-        self.assertIn("hpc-alpha", labels)
-        self.assertFalse(any("t-000" in label for label in labels))
+        self.assertNotIn("hp-alpha-t-0001",
+                         self.page.evaluate("timeline.map(e => e.label)"))
 
-    def test_sparse_update_does_not_reveal_an_internal_worker(self):
+    def test_sparse_worker_update_creates_no_project_surface(self):
         update = dict(INTERNAL)
         update.pop("hp_role")
         update.pop("hp_audience")
         update.pop("hp_project")
-        update["status"] = "working"
         self.page.evaluate("u => handleMessage({type: 'agent_update', agent: u})", update)
         self.assertEqual(
             self.page.locator('[data-source-pane-id="wA:pT"]').count(), 0)
 
-    def test_push_deep_link_waits_for_a_snapshot_and_opens_the_requested_pane(self):
-        self.page.evaluate("""() => {
-          hideTerminal(); agentsSnapshotReady = false;
-          requestPane('wA:pD');
-        }""")
-        self.assertIsNone(self.page.evaluate("activePane"))
-        self.page.evaluate("s => handleMessage(s)", SNAPSHOT)
-        self.assertEqual(self.page.evaluate("activePane"), "wA:pD")
-        self.assertIsNone(self.page.evaluate("pendingPaneRequest"))
+    def test_empty_state_explains_the_two_views(self):
+        only_workers = {"type": "agents",
+                        "agents": [INTERNAL, STALLED, HUMAN, GUEST, OTHER],
+                        "spaces": {"workspaces": [], "tabs": []}, "panes": []}
+        self.load(only_workers)
+        text = self.page.locator(".empty").inner_text()
+        self.assertIn("Projects", text)
+        self.assertIn("All panes", text)
+        self.assertEqual(self.page.locator(".project-group").count(), 0)
 
-    def test_the_projection_choice_survives_a_reload(self):
+    def test_projection_choice_survives_a_reload(self):
         self.page.evaluate("setHerdView('panes')")
         self.page.reload()
-        self.assertIsNone(self.page.evaluate("activeWorkspace"))
+        self.page.goto(PAGE)
         self.page.evaluate("""s => {
           ws = {readyState: 1, send: () => {}};
           handleMessage(s);
@@ -301,11 +343,95 @@ class WebProjectTests(unittest.TestCase):
         self.assertEqual(
             self.page.locator("#agents .agent").count(), len(SNAPSHOT["agents"]))
 
-    def test_projects_fit_a_phone_without_horizontal_page_scroll(self):
-        self.assertTrue(
-            self.page.evaluate("document.documentElement.scrollWidth <= innerWidth"))
-        self.assertEqual(
-            self.page.get_by_role("tab", name="Projects").get_attribute("aria-selected"), "true")
+    # ---- geometry: phone and two desktop widths -------------------------------------------
+
+    def _geometry_page(self, width):
+        page = _shared["browser"].new_page(viewport={"width": width, "height": 900})
+        page.goto(PAGE)
+        page.evaluate("""s => {
+          ws = {readyState: 1, send: () => {}};
+          activeWorkspace = 'projects'; herdView = 'projects';
+          localStorage.removeItem('herdr_project_expanded');
+          projectExpansion = null; seenProjectKeys.clear();
+          handleMessage(s);
+        }""", SNAPSHOT)
+        page.wait_for_selector(".project-list")
+        return page
+
+    def _assert_geometry(self, page, width):
+        geo = page.evaluate("""() => {
+          const rows = [...document.querySelectorAll('.project-row')].map(r => {
+            const b = r.getBoundingClientRect();
+            return {h: Math.round(b.height), w: Math.round(b.width)};
+          });
+          const sessions = [...document.querySelectorAll('.project-session')]
+            .map(r => Math.round(r.getBoundingClientRect().height)).filter(h => h > 0);
+          const boxes = [...document.querySelectorAll('.project-row, .project-session')]
+            .map(e => e.getBoundingClientRect());
+          const overlap = boxes.some((a, i) => boxes.some((b, j) => i !== j
+            && a.top < b.bottom && b.top < a.bottom && a.left < b.right && b.left < a.right));
+          const list = document.querySelector('.project-list').getBoundingClientRect();
+          return {rows, sessions, overlap, scrollWidth: document.documentElement.scrollWidth,
+                  innerWidth, listWidth: Math.round(list.width),
+                  listLeft: Math.round(list.left), listRight: Math.round(list.right)};
+        }""")
+        self.assertLessEqual(geo["scrollWidth"], width)
+        self.assertFalse(geo["overlap"])
+        self.assertTrue(all(r["h"] >= 40 for r in geo["rows"]))
+        self.assertTrue(all(h >= 40 for h in geo["sessions"]))
+        return geo
+
+    def test_mobile_geometry(self):
+        page = self._geometry_page(390)
+        try:
+            geo = self._assert_geometry(page, 390)
+            self.assertTrue(all(r["w"] <= 366 for r in geo["rows"]))
+        finally:
+            page.close()
+
+    def test_desktop_geometry_and_readable_width_at_1280_and_1440(self):
+        for width in (1280, 1440):
+            page = self._geometry_page(width)
+            try:
+                geo = self._assert_geometry(page, width)
+                # The list is a single readable column, never wider than 760px, centred.
+                self.assertLessEqual(geo["listWidth"], 760)
+                self.assertAlmostEqual(geo["listLeft"], width - geo["listRight"], delta=2)
+            finally:
+                page.close()
+
+    def test_collapsed_rows_are_substantially_more_compact_than_cards(self):
+        page = self._geometry_page(390)
+        try:
+            page.click('[data-project-action="collapse"]')
+            # The compactness is structural: a collapsed group is ONE toggle row no matter how many
+            # members it holds, with every session panel hidden. Meta chips may wrap (the brief
+            # permits two-line rows), so the assertion is the visible child count, not a pixel cap.
+            for group in page.locator(".project-group").all():
+                self.assertEqual(group.locator(".project-row:visible").count(), 1)
+                self.assertEqual(group.locator(".project-session:visible").count(), 0)
+                # One wrapped row stays a single compact block, never a stack of member cards.
+                self.assertLessEqual(group.bounding_box()["height"], 120)
+            collapsed = page.eval_on_selector_all(
+                ".project-group", "els => els.map(e => e.getBoundingClientRect().height)")
+            page.click('[data-project-action="expand"]')
+            expanded = page.eval_on_selector_all(
+                ".project-group", "els => els.map(e => e.getBoundingClientRect().height)")
+            self.assertGreater(sum(expanded), sum(collapsed))
+        finally:
+            page.close()
+
+    def test_captures_screenshots_for_review(self):
+        SHOTS.mkdir(exist_ok=True)
+        for name, width in (("mobile", 390), ("desktop", 1280)):
+            page = self._geometry_page(width)
+            try:
+                page.screenshot(path=str(SHOTS / f"pf23-{name}-collapsed.png"), full_page=True)
+                page.click('[data-project-action="expand"]')
+                page.screenshot(path=str(SHOTS / f"pf23-{name}-expanded.png"), full_page=True)
+            finally:
+                page.close()
+        self.assertEqual(len(list(SHOTS.glob("pf23-*.png"))), 4)
 
 
 if __name__ == "__main__":

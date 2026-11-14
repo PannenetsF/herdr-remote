@@ -56,8 +56,10 @@ function selectionInside(el) {
 }
 
 function render() {
-  const visible = activeWorkspace === 'projects' ? agents.filter(paneHuman) : agents;
-  document.getElementById('agentCount').textContent = visible.length ? `${visible.length}` : '';
+  const headerCount = activeWorkspace === 'projects'
+    ? buildProjectGroups(agents).length
+    : agents.length;
+  document.getElementById('agentCount').textContent = headerCount ? `${headerCount}` : '';
   const rows = workspaceRows();
   rebuildNameMaps(rows);
   // A terminal that appears or goes away beside the open pane changes the strips, and this is every
@@ -126,40 +128,178 @@ function viewSwitch() {
     + `</nav>`;
 }
 
-// The human herd has two levels of triage: the attention section, then the registered project.
-// Only coordinator/hand-started session panes are rows. Worker threads never get a card; their
-// human/stalled escalations are aggregated as a follow-up count on the owning coordinator.
-function renderProjectHerd() {
-  // Aggregate over the FULL snapshot: the follow-up counts live on worker panes that the filter
-  // below removes, so withFollowups must run before paneHuman or every badge would come back zero.
-  const visible = withFollowups(agents).filter(paneHuman);
-  const sections = triage(visible, recentDir, projectBucket);
-  let html = '';
-  for (const s of sections) {
-    if (!s.panes.length) continue;
-    html += sectionHeader(s);
-    if (s.key === 'recent' && !recentOpen) continue;
-    const projects = new Map();
-    for (const p of s.panes) {
-      const key = projectKey(p);
-      if (!projects.has(key)) projects.set(key, []);
-      projects.get(key).push(p);
-    }
-    for (const panes of projects.values()) {
-      const p = panes[0];
-      const host = p.host && p.host !== 'local' ? ` @${p.host}` : '';
-      html += `<div class="project-heading"><span>${escapeHtml(effectiveProject(p))}${escapeHtml(host)}</span>`
-        + `<span class="sec-count">${panes.length}</span></div>`;
-      html += panes.map(pane => agentCard(pane, 'project')).join('');
-    }
+// pf.23: Projects is one compact row PER PROJECT, not a set of global status sections that split
+// one project across the screen. A row expands inline into that project's coordinator/session
+// panes; worker threads never appear anywhere here (they stay in All panes).
+const PROJECT_EXPAND_STORE = 'herdr_project_expanded';
+// null means "reader has never managed expansion": attention projects open by default. Once they
+// toggle anything (or expand/collapse all) it becomes an explicit, persisted key set.
+let projectExpansion = loadProjectExpansion();
+const seenProjectKeys = new Set();
+
+function loadProjectExpansion() {
+  try {
+    const raw = localStorage.getItem(PROJECT_EXPAND_STORE);
+    return raw === null ? null : new Set(JSON.parse(raw));
+  } catch {
+    return null;
   }
-  if (!visible.length) {
-    const hidden = agents.length - visible.length;
-    html += hidden
-      ? `<div class="empty">No coordinator or manual sessions need attention. ${hidden} internal pane${hidden === 1 ? '' : 's'} — open All panes to inspect them.</div>`
+}
+
+function persistProjectExpansion() {
+  if (projectExpansion === null) return;
+  try {
+    localStorage.setItem(PROJECT_EXPAND_STORE, JSON.stringify([...projectExpansion]));
+  } catch { /* storage unavailable: expansion simply does not persist */ }
+}
+
+function projectIsAttention(group) {
+  return PROJECT_BUCKET_RANK[group.worstBucket] <= PROJECT_BUCKET_RANK.ready;
+}
+
+function isProjectExpanded(group, isFirst) {
+  if (projectExpansion === null) {
+    // Implicit defaults also register first sight, so materializing the Set later never makes a
+    // group that was already on screen look brand-new.
+    seenProjectKeys.add(group.key);
+    return isFirst || projectIsAttention(group);
+  }
+  if (!seenProjectKeys.has(group.key)) {
+    seenProjectKeys.add(group.key);
+    // A project appearing after the reader made explicit choices: urgent ones open themselves,
+    // without collapsing or touching anything already listed.
+    if (projectIsAttention(group)) projectExpansion.add(group.key);
+  }
+  return projectExpansion.has(group.key);
+}
+
+function toggleProject(key) {
+  const groups = buildProjectGroups(agents);
+  if (projectExpansion === null) {
+    // Materialize the implicit defaults so the first explicit gesture changes only what it taps.
+    projectExpansion = new Set(
+      groups.filter((g, i) => i === 0 || projectIsAttention(g)).map(g => g.key));
+  }
+  if (projectExpansion.has(key)) projectExpansion.delete(key);
+  else projectExpansion.add(key);
+  persistProjectExpansion();
+  render();
+}
+
+function setAllProjectsExpanded(open) {
+  projectExpansion = new Set(open ? buildProjectGroups(agents).map(g => g.key) : []);
+  persistProjectExpansion();
+  render();
+}
+
+// A push deep-link names a pane; its project must be open when the reader comes back to the list,
+// even if the project was collapsed. Primary panes only -- worker deep links do not exist in pf.22.
+function expandProjectForPane(paneId) {
+  const p = agents.find(a => a.pane_id === paneId);
+  if (!p || !paneHuman(p)) return;
+  const key = projectKey(p);
+  if (projectExpansion === null) {
+    projectExpansion = new Set(
+      buildProjectGroups(agents).filter((g, i) => i === 0 || projectIsAttention(g)).map(g => g.key));
+  }
+  if (!projectExpansion.has(key)) {
+    projectExpansion.add(key);
+    persistProjectExpansion();
+  }
+}
+
+function projectCountNoun(n, word) {
+  return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+// The honest composition line: role counts first, then only the state bits that are non-zero.
+// Rendered as atomic chips so a narrow screen never splits "· 1" from its word.
+function projectMetaChips(g) {
+  const chips = [];
+  if (g.coordinatorCount) chips.push(projectCountNoun(g.coordinatorCount, 'coordinator'));
+  if (g.sessionCount) chips.push(projectCountNoun(g.sessionCount, 'session'));
+  if (g.blockedCount) chips.push(projectCountNoun(g.blockedCount, 'blocked'));
+  if (g.readyCount) chips.push(projectCountNoun(g.readyCount, 'ready'));
+  if (g.activeCount) chips.push(projectCountNoun(g.activeCount, 'active'));
+  return chips.map(t => `<span class="project-meta-chip">${escapeHtml(t)}</span>`).join('');
+}
+
+// The strongest right-aligned signal: escalated worker follow-ups win, then real blocks, then
+// ready-but-unseen. Plain working/recent projects carry no badge at all.
+function projectAttentionBadge(g) {
+  if (g.followupCount) {
+    return `<span class="project-count is-followups" aria-label="${g.followupCount} thread follow-ups">`
+      + `${g.followupCount} follow-up${g.followupCount === 1 ? '' : 's'}</span>`;
+  }
+  if (g.blockedCount) {
+    return `<span class="project-count is-blocked">${projectCountNoun(g.blockedCount, 'blocked')}</span>`;
+  }
+  if (g.readyCount) {
+    return `<span class="project-count is-ready">${projectCountNoun(g.readyCount, 'ready')}</span>`;
+  }
+  return '';
+}
+
+// A compact in-accordion session row. The live activity title gets the width first (a truncated
+// hpc-* label is useless as a primary); the pane name and role sit quietly beneath it.
+function projectSessionCard(p) {
+  const role = (p.hp_role || '').trim() === 'coordinator' ? 'Coordinator' : 'Session';
+  const primary = (p.title || '').trim() || paneName(p);
+  const state = memberStateLabel(p);
+  const bucket = projectBucket(p);
+  const badge = p.ownsFollowups && p.followupCount
+    ? `<span class="ps-followups" aria-label="${p.followupCount} thread follow-ups">`
+      + `${p.followupCount} follow-up${p.followupCount === 1 ? '' : 's'}</span>` : '';
+  return `<li class="project-session" role="button" tabindex="0" data-pane-id="${escapeAttr(p.pane_id)}"`
+    + ` data-source-pane-id="${escapeAttr(p.pane_id)}" data-agent-name="${escapeAttr(paneName(p))}"`
+    + ` data-bucket="${bucket}" aria-label="${escapeAttr(primary)}, ${role}, ${state}">`
+    + `<span class="dot" style="background:${TRIAGE_COLOR[bucket]}" aria-hidden="true"></span>`
+    + `<span class="ps-main"><span class="ps-title">${escapeHtml(primary)}</span>`
+    + `<span class="ps-sub"><span class="ps-name">${escapeHtml(paneName(p))}</span>`
+    + `<span class="ps-role">${role}</span><span class="ps-state" data-state="${state}">${state}</span></span></span>`
+    + badge + `</li>`;
+}
+
+function renderProjectHerd() {
+  const groups = buildProjectGroups(agents);
+  if (!groups.length) {
+    const hidden = agents.length;
+    return hidden
+      ? `<div class="empty">Projects lists coordinators and hand-started sessions; the ${hidden} `
+        + `worker and guest pane${hidden === 1 ? '' : 's'} here belong to All panes.</div>`
       : emptyStateHtml();
   }
-  return html;
+  const attentionTotal = groups.filter(projectIsAttention).length;
+  const toolbar = `<div class="project-toolbar">`
+    + `<span class="project-summary">${attentionTotal} `
+    + `${attentionTotal === 1 ? 'project needs' : 'projects need'} attention</span>`
+    + `<span class="project-toolbar-actions">`
+    + `<button type="button" class="project-tool-btn" data-project-action="expand">Expand all</button>`
+    + `<button type="button" class="project-tool-btn" data-project-action="collapse">Collapse all</button>`
+    + `</span></div>`;
+  let html = toolbar + '<ul class="project-list">';
+  groups.forEach((g, i) => {
+    const expanded = isProjectExpanded(g, i === 0);
+    const panelId = `project-sessions-${i}`;
+    // Host only when it distinguishes the row: a remote host is named, the local machine is not.
+    // It leads the meta line inside the main column, so it never floats into the badge's space.
+    const hostChip = g.host !== 'local'
+      ? `<span class="project-meta-chip is-host">@${escapeHtml(g.host)}</span>` : '';
+    html += `<li class="project-group${expanded ? ' expanded' : ''}" data-project-key="${escapeAttr(g.key)}"`
+      + ` data-bucket="${g.worstBucket}">`
+      + `<div class="project-row" role="button" tabindex="0" aria-expanded="${expanded}"`
+      + ` aria-controls="${panelId}" data-project-toggle="${escapeAttr(g.key)}">`
+      + `<span class="chevron" aria-hidden="true"></span>`
+      + `<span class="dot project-dot" style="background:${TRIAGE_COLOR[g.worstBucket]}" aria-hidden="true"></span>`
+      + `<span class="project-main"><span class="project-slug">${escapeHtml(g.slug)}</span>`
+      + `<span class="project-meta">${hostChip}${projectMetaChips(g)}</span></span>`
+      + projectAttentionBadge(g)
+      + `</div>`
+      + `<ul class="project-sessions" id="${panelId}">`
+      + g.members.map(projectSessionCard).join('')
+      + `</ul></li>`;
+  });
+  return html + '</ul>';
 }
 
 // The raw herd, retained for older relays and as the All panes default.
@@ -329,6 +469,13 @@ function bindRowHandlers() {
     activateOn(el, () => selectTab(key));
     setupLongPress(el, 'tab', key, el.dataset.tabName);
   });
+  document.querySelectorAll('[data-project-toggle]').forEach(el => {
+    activateOn(el, () => toggleProject(el.dataset.projectToggle));
+  });
+  document.querySelectorAll('[data-project-action]').forEach(el => {
+    el.addEventListener('click', () =>
+      setAllProjectsExpanded(el.dataset.projectAction === 'expand'));
+  });
   // Bind to agents
   document.querySelectorAll('[data-pane-id]').forEach(el => {
     const id = el.dataset.paneId;
@@ -441,6 +588,9 @@ function switchHerdrSession(host, session) {
   pendingPaneRequest = null;
   previousAttention = {};
   previousFollowups = new Map();
+  // A new herdr session is a new project universe, so implicit first-sight expansion re-runs;
+  // the reader's explicit stored choices stay in localStorage.
+  seenProjectKeys.clear();
   agents = [];
   render();
   ws.send(JSON.stringify({ type: 'session_switch', host, session }));

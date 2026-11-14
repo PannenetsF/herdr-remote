@@ -127,13 +127,69 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .view-switch { display: flex; gap: 4px; margin: 0 0 8px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
 .view-switch button { flex: 1; min-height: 32px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font: 600 0.75rem var(--font-mono); cursor: pointer; }
 .view-switch button.active { background: var(--text); color: var(--bg); }
-.project-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 12px 3px 6px; color: var(--muted); font-size: 0.7rem; font-weight: 600; }
-.project-heading > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.project-heading .sec-count { flex: none; font-weight: 400; opacity: 0.65; }
 
-/* Aggregate worker follow-ups on the owning coordinator card; no thread gets its own row. */
-.follow-badge { margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--red);
-  color: #fff; font-size: 0.62rem; font-weight: 700; white-space: nowrap; vertical-align: middle; }
+/* pf.23 Projects: one compact row per project, sessions inside an inline accordion. */
+.project-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  margin: 2px 2px 8px; }
+.project-summary { font-size: 0.68rem; font-weight: 600; letter-spacing: 0.04em;
+  text-transform: uppercase; color: var(--muted); white-space: nowrap; }
+.project-toolbar-actions { display: flex; gap: 4px; flex: none; }
+.project-tool-btn { border: 1px solid var(--border); background: var(--bg); color: var(--muted);
+  border-radius: 7px; padding: 4px 10px; min-height: 32px; font: 600 0.68rem var(--font-mono);
+  cursor: pointer; }
+.project-tool-btn:hover { color: var(--text); border-color: color-mix(in srgb, var(--text) 25%, transparent); }
+.project-list { list-style: none; margin: 0; padding: 0; }
+.project-group { border: 1px solid var(--border); border-radius: 12px; margin-bottom: 8px;
+  background: var(--surface); overflow: hidden; }
+.project-group[data-bucket="needs"] { border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+.project-group[data-bucket="ready"] { border-color: color-mix(in srgb, var(--orange) 40%, var(--border)); }
+/* The whole row is one hit target: >=40px tall, one toggle control, nothing interactive nested. */
+.project-row { display: flex; align-items: center; gap: 9px; min-height: 44px; padding: 8px 12px;
+  cursor: pointer; }
+.project-row:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; border-radius: 12px; }
+.chevron { flex: none; width: 8px; height: 8px; border-right: 1.6px solid var(--muted);
+  border-bottom: 1.6px solid var(--muted); transform: rotate(-45deg); transition: transform 0.16s var(--ease); }
+.project-group.expanded .chevron { transform: rotate(45deg); }
+.project-dot { flex: none; width: 9px; height: 9px; }
+.project-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+/* The full slug may wrap to two lines instead of truncating into a useless hpc- prefix. */
+.project-slug { font-size: 0.86rem; font-weight: 600; line-height: 1.25; overflow-wrap: anywhere; }
+/* Meta chips wrap as atomic units, never splitting "1" from "blocked" on a phone. */
+.project-meta { display: flex; flex-wrap: wrap; gap: 3px 7px; font-size: 0.66rem; color: var(--muted); }
+.project-meta-chip { white-space: nowrap; }
+.project-meta-chip + .project-meta-chip::before { content: "·"; margin-right: 7px; color: var(--muted); }
+.project-meta-chip.is-host { color: var(--orange); }
+.project-count { flex: none; margin-left: 4px; padding: 2px 8px; border-radius: 999px;
+  font-size: 0.64rem; font-weight: 700; white-space: nowrap; }
+.project-count.is-followups { background: var(--red); color: #fff; }
+.project-count.is-blocked { background: color-mix(in srgb, var(--red) 14%, var(--surface));
+  color: var(--red); border: 1px solid color-mix(in srgb, var(--red) 40%, transparent); }
+.project-count.is-ready { background: color-mix(in srgb, var(--orange) 14%, var(--surface));
+  color: var(--orange); border: 1px solid color-mix(in srgb, var(--orange) 40%, transparent); }
+.project-sessions { list-style: none; margin: 0; padding: 0 8px 8px 30px; display: none; }
+.project-group.expanded .project-sessions { display: block; }
+.project-session { display: flex; align-items: center; gap: 8px; min-height: 40px; padding: 6px 8px;
+  border-radius: 9px; cursor: pointer; }
+.project-session + .project-session { border-top: 1px solid color-mix(in srgb, var(--border) 70%, transparent); }
+.project-session:hover { background: color-mix(in srgb, var(--text) 5%, transparent); }
+.project-session:focus-visible { outline: 2px solid var(--text); outline-offset: -2px; }
+.project-session .dot { flex: none; width: 8px; height: 8px; }
+.ps-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ps-title { font-size: 0.76rem; line-height: 1.3; overflow-wrap: anywhere; }
+.ps-sub { display: flex; align-items: center; gap: 7px; min-width: 0;
+  font-size: 0.62rem; color: var(--muted); }
+.ps-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.ps-role { flex: none; text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.85; }
+.ps-state { flex: none; padding: 0 6px; border-radius: 999px; background: color-mix(in srgb, var(--text) 8%, transparent); }
+.ps-state[data-state="blocked"] { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
+.ps-state[data-state="active"] { color: var(--green); }
+.ps-state[data-state="ready"] { color: var(--orange); }
+/* The group row carries the solid, strongest badge; inside the accordion the same count is a
+   quiet outline pill, so one project does not show two full-strength red blocks. */
+.ps-followups { flex: none; margin-left: 6px; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, transparent);
+  color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent);
+  font-size: 0.62rem; font-weight: 700; white-space: nowrap; }
 
 /* Agent list */
 .agents { padding: 12px; }
@@ -511,6 +567,9 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
   body:has(.terminal-view.active) > .view { display: none; }
   .agents { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; }
   .section-header { grid-column: 1 / -1; }
+  /* Projects is a single-column list, not a tile wall: one project row reads best at reading width. */
+  .project-toolbar, .project-list { grid-column: 1 / -1; width: 100%; max-width: 760px;
+    margin-left: auto; margin-right: auto; }
   .tab-heading, .empty-tab { grid-column: 1 / -1; }
   .chip-strip { grid-column: 1 / -1; }
   .term-content { min-height: 400px; }

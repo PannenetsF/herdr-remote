@@ -43,11 +43,6 @@ function effectiveProject(p) {
 function projectKey(p) { return `${p.host || 'local'}|${effectiveProject(p)}`; }
 function paneIdentity(p) { return `${p.host || 'local'}|${p.pane_id || ''}`; }
 
-function threadName(p) {
-  const id = (p.hp_group || '').split('!').pop() || '';
-  return /^t-\d+$/.test(id) ? id : p.label || p.pane_id;
-}
-
 // Escalated workers grouped by the project+host they belong to. A project with no live
 // coordinator gets no badge and no standalone worker card -- its threads remain reachable only in
 // All panes, which is the deliberate scope.
@@ -97,6 +92,63 @@ function withFollowups(list) {
 function projectBucket(p) {
   if (p.ownsFollowups) return 'needs';
   return bucketOf(p);
+}
+
+// ---- pf.23: one row per (host, project), sessions inside an accordion ------------------------
+//
+// The Projects view no longer splits a project across global status sections. These groups are the
+// single projection every project row reads from: follow-up aggregation still runs over the FULL
+// snapshot (withFollowups), then only primary sessions survive as members. Threads never become
+// members or rows; their escalations are the group's follow-up count on its owning coordinator.
+const PROJECT_BUCKET_RANK = { needs: 0, ready: 1, working: 2, recent: 3 };
+
+function friendlyHost(host) {
+  const h = (host || 'local').trim();
+  return h === 'local' ? 'local' : h;
+}
+
+function memberStateLabel(p) {
+  if (p.status === 'blocked') return 'blocked';
+  if (p.status === 'working') return 'active';
+  if (p.status === 'done') return isUnseen(p) ? 'ready' : 'done';
+  return 'idle';
+}
+
+function buildProjectGroups(list) {
+  const enriched = withFollowups(list);
+  const byKey = new Map();
+  for (const p of enriched) {
+    if (!paneHuman(p)) continue;
+    const key = projectKey(p);
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        key, host: friendlyHost(p.host), slug: effectiveProject(p), members: [],
+      });
+    }
+    byKey.get(key).members.push(p);
+  }
+  const groups = [...byKey.values()].map(g => {
+    g.members.sort((a, b) => (a.order ?? Infinity) - (b.order ?? Infinity));
+    g.coordinatorCount = g.members.filter(m => (m.hp_role || '').trim() === 'coordinator').length;
+    // Hand-started sessions plus legacy fail-open panes with no authoritative role.
+    g.sessionCount = g.members.length - g.coordinatorCount;
+    g.blockedCount = g.members.filter(m => m.status === 'blocked').length;
+    g.readyCount = g.members.filter(isUnseen).length;
+    g.activeCount = g.members.filter(m => m.status === 'working').length;
+    g.followupCount = g.members.reduce((n, m) => n + (m.ownsFollowups ? m.followupCount : 0), 0);
+    g.worstBucket = g.members.reduce((worst, m) => {
+      const b = projectBucket(m);
+      return worst === null || PROJECT_BUCKET_RANK[b] < PROJECT_BUCKET_RANK[worst] ? b : worst;
+    }, null);
+    g.lastActiveAt = Math.max(0, ...g.members.map(m => m.last_active_at || 0));
+    return g;
+  });
+  // Urgency first; the no-timestamp path compares equal everywhere, so stable input order holds.
+  groups.sort((a, b) => {
+    const byRank = PROJECT_BUCKET_RANK[a.worstBucket] - PROJECT_BUCKET_RANK[b.worstBucket];
+    return byRank || (b.lastActiveAt - a.lastActiveAt);
+  });
+  return groups;
 }
 
 // ---- Attention: chime + human timeline are primary-session only -----------------------------

@@ -50,7 +50,11 @@ function requestPane(paneId) {
 function openRequestedPane() {
   if (!pendingPaneRequest || !agentsSnapshotReady) return;
   const {pane} = pendingPaneRequest;
-  if (paneById(pane)) openTerminal(pane);
+  if (paneById(pane)) {
+    // Open the accordion group first, so the project is expanded when the reader returns to the list.
+    if (typeof expandProjectForPane === 'function') expandProjectForPane(pane);
+    openTerminal(pane);
+  }
   // The complete snapshot is authoritative: do not retain a stale notification indefinitely and
   // open an unrelated pane that later reuses the id.
   pendingPaneRequest = null;
