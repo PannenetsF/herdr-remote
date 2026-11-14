@@ -57,10 +57,8 @@ function handleMessage(msg) {
     // Track timeline on status changes
     for (const a of msg.agents) {
       const prev = prevStatuses[a.pane_id];
-      if (prev && prev !== a.status) {
-        timeline.unshift({project: a.project, agent: a.agent, status: a.status, time: new Date()});
-        if (timeline.length > 100) timeline.pop();
-      }
+      const attentionChanged = trackAttention(a);
+      if (prev && prev !== a.status && !attentionChanged) recordTimeline(a, a.status);
       prevStatuses[a.pane_id] = a.status;
     }
     const previousAgents = new Map(agents.map(agent => [agent.pane_id, agent]));
@@ -80,6 +78,8 @@ function handleMessage(msg) {
         selected_options: previous.selected_options,
       };
     });
+    agentsSnapshotReady = true;
+    openRequestedPane();
     render();
   }
   else if (msg.type === 'agent_update') {
@@ -89,9 +89,9 @@ function handleMessage(msg) {
     const previousStatus = existing?.status || prevStatuses[update.pane_id];
     if (existing) Object.assign(existing, update);
     else agents.push({...update});
-    if (previousStatus && previousStatus !== update.status) {
-      timeline.unshift({project: update.project, agent: update.agent, status: update.status, time: new Date()});
-      if (timeline.length > 100) timeline.pop();
+    const attentionChanged = trackAttention(existing || update);
+    if (previousStatus && previousStatus !== update.status && !attentionChanged) {
+      recordTimeline(existing || update, update.status);
     }
     prevStatuses[update.pane_id] = update.status;
     render();
@@ -111,15 +111,10 @@ function handleMessage(msg) {
       a.multi=msg.multi;
     }
     else agents.push({...msg, status:'blocked'});
-    // Only for a block the reader has not been told about. `update` marks a re-broadcast of a
-    // pane already announced -- which now includes the one the relay sends after every toggle, so
-    // an unguarded chime sounded the agent-needs-you alert on each of the reader's own taps. The
-    // same flag already gates the timeline entry below and the web push on the relay's side.
-    if(window.cue && !msg.update) cue('chime');
-    if (!msg.update) {
-      timeline.unshift({project: msg.project, agent: msg.agent, status: 'blocked', time: new Date()});
-      if (timeline.length > 100) timeline.pop();
-    }
+    // Attention identity, not terminal repaint frequency, drives sound and the human timeline.
+    // A stalled upgrade may be an `update` of the same prompt and still be new to the reader.
+    const attentionChanged = trackAttention(a || msg);
+    if (!msg.update && !attentionChanged) recordTimeline(a || msg, 'blocked');
     render();
     if (msg.pane_id===activePane) openTerminal(activePane);
   } else if (msg.type === 'pane_content' && msg.pane_id === activePane) {

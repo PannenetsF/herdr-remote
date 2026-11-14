@@ -59,9 +59,9 @@ function worstTriage(list) {
  *
  *  The no-timestamp path is free: every comparator returns 0, `Array.prototype.sort` is stable, so
  *  each section keeps the order the relay already sent. No feature detection, no branch. */
-function triage(list, dir) {
+function triage(list, dir, classify = bucketOf) {
   const into = {needs: [], ready: [], working: [], recent: []};
-  for (const p of list) into[bucketOf(p)].push(p);
+  for (const p of list) into[classify(p)].push(p);
   const byDesc = key => (x, y) => (key(y) || 0) - (key(x) || 0);
   const active = byDesc(p => p.last_active_at);
   into.needs.sort(active);

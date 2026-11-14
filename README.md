@@ -16,6 +16,7 @@ curl -sL https://github.com/dcolinmorgan/herdr-remote/releases/download/v0.8.1/H
 
 ## What you get
 
+- **Projects-first dashboard** -- coordinators and hand-started sessions, grouped by registered herdr project; **All panes** remains available for every live worker and shell
 - **Live agent timeline** -- who worked when, who blocked, who finished
 - **One-tap approvals** from phone, menu bar, or Telegram
 - **Daily activity digest** -- `/digest` in Telegram shows working time + block count

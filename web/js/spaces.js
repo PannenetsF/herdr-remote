@@ -56,7 +56,8 @@ function selectionInside(el) {
 }
 
 function render() {
-  document.getElementById('agentCount').textContent = agents.length ? `${agents.length}` : '';
+  const visible = activeWorkspace === 'projects' ? agents.filter(paneHuman) : agents;
+  document.getElementById('agentCount').textContent = visible.length ? `${visible.length}` : '';
   const rows = workspaceRows();
   rebuildNameMaps(rows);
   // A terminal that appears or goes away beside the open pane changes the strips, and this is every
@@ -68,13 +69,15 @@ function render() {
   // exactly when the panes span more than one space.
   const occupied = new Set([...agents, ...shellPanes]
     .map(p => agentWorkspaceKey(p)).filter(k => !k.endsWith('|')));
-  if (occupied.size <= 1) { activeWorkspace = null; activeTab = null; }
+  if (occupied.size <= 1 && activeWorkspace !== 'projects') { activeWorkspace = null; activeTab = null; }
   const list = document.getElementById('agents');
   // Checked here rather than at the top of render(), so the name maps and the sibling strips still
   // track the truth while the list itself holds still.
   if (selectionInside(list)) return;
   const strips = chipStripScroll(list);
-  list.innerHTML = activeWorkspace ? renderSpaceView(rows) : renderHerd(rows, occupied);
+  const html = activeWorkspace === 'projects' ? renderProjectHerd()
+    : activeWorkspace ? renderSpaceView(rows) : renderHerd(rows, occupied);
+  list.innerHTML = viewSwitch() + html;
   restoreChipStripScroll(list, strips);
   bindRowHandlers();
 }
@@ -107,7 +110,57 @@ function restoreChipStripScroll(list, kept) {
   }
 }
 
-// The herd, in the one order the app agrees on. AGENTS only: two thirds of the panes on a real host
+function setHerdView(view) {
+  herdView = view === 'panes' ? 'panes' : 'projects';
+  localStorage.setItem('herdr_herd_view', herdView);
+  activeWorkspace = view === 'panes' ? null : 'projects';
+  activeTab = null;
+  render();
+}
+
+function viewSwitch() {
+  const projects = activeWorkspace === 'projects';
+  return `<nav class="view-switch" role="tablist" aria-label="Agent projection">`
+    + `<button role="tab" aria-selected="${projects}" class="${projects ? 'active' : ''}" onclick="setHerdView('projects')">Projects</button>`
+    + `<button role="tab" aria-selected="${!projects}" class="${!projects ? 'active' : ''}" onclick="setHerdView('panes')">All panes</button>`
+    + `</nav>`;
+}
+
+// The human herd has two levels of triage: the attention section, then the registered project.
+// Coordinator and hand-started session rows remain separate even when several belong to one
+// project. A thread becomes a row only after herdr-projects assigns it to the human.
+function renderProjectHerd() {
+  const visible = agents.filter(paneHuman);
+  const sections = triage(visible, recentDir, p => humanThread(p) ? 'needs' : bucketOf(p));
+  let html = '';
+  for (const s of sections) {
+    if (!s.panes.length) continue;
+    html += sectionHeader(s);
+    if (s.key === 'recent' && !recentOpen) continue;
+    const projects = new Map();
+    for (const p of s.panes) {
+      const key = projectKey(p);
+      if (!projects.has(key)) projects.set(key, []);
+      projects.get(key).push(p);
+    }
+    for (const panes of projects.values()) {
+      const p = panes[0];
+      const host = p.host && p.host !== 'local' ? ` @${p.host}` : '';
+      html += `<div class="project-heading"><span>${escapeHtml(effectiveProject(p))}${escapeHtml(host)}</span>`
+        + `<span class="sec-count">${panes.length}</span></div>`;
+      html += panes.map(pane => agentCard(pane, 'project')).join('');
+    }
+  }
+  if (!visible.length) {
+    const hidden = agents.length - visible.length;
+    html += hidden
+      ? `<div class="empty">No coordinator or manual sessions need attention. ${hidden} internal pane${hidden === 1 ? '' : 's'} — open All panes to inspect them.</div>`
+      : emptyStateHtml();
+  }
+  return html;
+}
+
+// The raw herd, retained for older relays and as the All panes default.
 // are bare shells with no status at all, and triaging them would bury ten agents under twenty rows
 // that can never be anything but Recent. They are reached through the space view, which groups by
 // tab, and through the sibling strip inside a session.
@@ -382,6 +435,9 @@ function switchHerdrSession(host, session) {
   // the send will happen, so a dead socket can't leave the UI stuck showing
   // "switching…" forever.
   switchingSession = true;
+  agentsSnapshotReady = false;
+  pendingPaneRequest = null;
+  previousAttention = {};
   agents = [];
   render();
   ws.send(JSON.stringify({ type: 'session_switch', host, session }));

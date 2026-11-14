@@ -25,11 +25,39 @@ function shellPane(id) { return shellPanes.find(p => p.pane_id === id); }
 // One lookup for both kinds. Agents win: a pane_id is unique per host and the two lists are
 // disjoint, but if a pane gains an agent between polls the agent record is the fuller one.
 function paneById(id) { return agents.find(a => a.pane_id === id) || shellPane(id); }
-let timeline = [], prevStatuses = {};
+let timeline = [], rawTimeline = [], prevStatuses = {};
+// Projects is the human-facing control surface. The raw workspace/tab view remains available for
+// shells, guest harnesses, thread diagnostics and ordinary sessions on older hosts.
+let herdView = localStorage.getItem('herdr_herd_view') === 'panes' ? 'panes' : 'projects';
 // Selections are host-qualified keys, not bare ids: every herdr numbers its own workspaces w1,
 // w2, ... so on a relay watching two hosts an id alone picks out two different spaces.
-let activeWorkspace = null;
+let activeWorkspace = herdView === 'panes' ? null : 'projects';
 let activeTab = null;
+// Push notifications address a pane, not whichever card happened to be first. Hold the request
+// until a complete snapshot can resolve it; a target that is absent has already exited.
+let pendingPaneRequest = null;
+let agentsSnapshotReady = false;
+const initialPaneRequest = new URLSearchParams(location.search);
+if (initialPaneRequest.get('pane')) {
+  pendingPaneRequest = {pane: initialPaneRequest.get('pane')};
+}
+
+function requestPane(paneId) {
+  pendingPaneRequest = {pane: paneId};
+  openRequestedPane();
+}
+
+function openRequestedPane() {
+  if (!pendingPaneRequest || !agentsSnapshotReady) return;
+  const {pane} = pendingPaneRequest;
+  if (paneById(pane)) openTerminal(pane);
+  // The complete snapshot is authoritative: do not retain a stale notification indefinitely and
+  // open an unrelated pane that later reuses the id.
+  pendingPaneRequest = null;
+  const url = new URL(location.href);
+  url.searchParams.delete('pane');
+  history.replaceState(history.state, '', url);
+}
 // The hierarchy as herdr reports it -- real labels, the operator's numbering, which space is
 // focused, and how many panes each holds in total. Arrives with every `agents` broadcast; a relay
 // that predates it (and the demo worker) sends none, and then the ids carried on the agents
@@ -194,9 +222,10 @@ function hidePanel() {
 }
 
 function renderTimeline() {
+  const events = activeWorkspace === 'projects' ? timeline : rawTimeline;
   const el = document.getElementById('timelineList');
-  if (!timeline.length) { el.innerHTML = '<p style="color:var(--muted);text-align:center;padding:40px">No activity yet. Status changes appear here.</p>'; return; }
-  el.innerHTML = timeline.map(e => {
+  if (!events.length) { el.innerHTML = '<p style="color:var(--muted);text-align:center;padding:40px">No activity yet. Status changes appear here.</p>'; return; }
+  el.innerHTML = events.map(e => {
     const t = e.time.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
     const color = e.status==='blocked'?'var(--red)':e.status==='working'?'var(--green)':'var(--muted)';
     // project and agent are the pane's, so they are agent-supplied: project is basename(cwd), and

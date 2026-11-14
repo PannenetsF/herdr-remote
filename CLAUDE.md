@@ -366,6 +366,23 @@ a space (which groups by tab and shows both kinds together) and from the sibling
 session. A terminal's dot is **hollow** rather than a fifth shade competing with the four buckets,
 which is the same thing `worstTriage` says by returning null for a set holding only these.
 
+**Projects is the default herd projection; All panes preserves the raw one.** `web/js/audience.js`
+keeps coordinators and hand-started `session` panes, groups them by registered `hp_project` (plus
+host, so equal slugs on two machines stay separate), and hides ordinary internal threads, guests and
+other worker roles. A thread with `hp_audience=human` appears in Needs you even when its process is
+done and routes back to its project's first live coordinator; a `stalled` thread opens directly.
+Multiple coordinators remain separate cards. Missing role metadata falls back to herdr's names/cwd
+and fails open for ordinary sessions, so older hosts do not lose their panes. The raw `agents` array
+is never filtered: Terminal, sibling navigation, Spaces, Tabs and All panes still address every live
+pane.
+
+The same projection drives the default Timeline, sound and Web Push rather than making each surface
+invent its own worker filter. `relay/audience.py` mirrors it for pushes. Attention is keyed by role
+and audience, not just prompt fingerprints: an `internal → stalled` upgrade in a full snapshot or a
+sparse update must chime and push exactly once even when the prompt is unchanged. All panes retains
+the unfiltered timeline. Projects/All panes is persisted per browser. These paths are exercised in
+`tests/test_web_projects.py` and `tests/test_audience.py`.
+
 **The herd list is `triage`, the one ordering the whole page agrees on**: `Needs you` → `Ready ·
 unseen` → `Working` → `Recent`, tested in `tests/test_web_spaces.py`. Ported from Collie's
 `lib/triage.ts`, and the point of it is one classifier — `bucketOf` — that the rows, the space chips
@@ -621,7 +638,9 @@ live activity, not a session name: a working claude sets it to what it is doing,
 The durable title comes back from `get_history`), `status`, `cwd`, `project`, `host`, `remote`,
 `workspace_id`, `tab_id`, `focused` (the one pane per host herdr itself has in front),
 `scrollback` + `viewport_rows` (from herdr's `scroll`), `has_session` (this pane names an agent
-transcript), `order` (see below), and `last_active_at` / `last_seen_at` (epoch **milliseconds**,
+transcript), `hp_role` / `hp_project` / `hp_audience` / `hp_group` (authoritative herdr-projects
+role, project slug, human-audience state and group when the host supplies them), `order` (see below),
+and `last_active_at` / `last_seen_at` (epoch **milliseconds**,
 because every client that will compare them is JavaScript). The session ref itself stays
 server-side in `pane_session_map`.
 

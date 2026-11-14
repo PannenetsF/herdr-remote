@@ -29,6 +29,18 @@ except ModuleNotFoundError:
     complete_agent_update_message = _agent_state_module.complete_agent_update_message
 
 try:
+    import audience
+except ModuleNotFoundError:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    _audience_spec = spec_from_file_location(
+        "herdr_remote_audience",
+        os.path.join(os.path.dirname(__file__), "audience.py"),
+    )
+    audience = module_from_spec(_audience_spec)
+    _audience_spec.loader.exec_module(audience)
+
+try:
     import transcript
 except ModuleNotFoundError:
     from importlib.util import module_from_spec, spec_from_file_location
@@ -253,6 +265,10 @@ _activity_status = {}
 _activity_dirty = False
 _activity_flush_task = None
 last_blocked_prompts = {}
+# pane_id -> the audience class last sent to Web Push. A prompt can remain byte-identical while
+# herdr-projects upgrades its audience from internal to stalled, so prompt fingerprints alone are
+# not a sufficient notification ledger.
+last_push_audience = {}
 # (host, pane_id) -> does this idle pane hold a question. Keyed with the host like the activity
 # ledger, because every herdr numbers its own panes.
 question_panes = {}
@@ -837,6 +853,37 @@ async def send_web_push(title: str, body: str, url: str = "/", clear: bool = Fal
         payload = json.dumps({"title": title, "body": body, "url": url})
     headers = {"Topic": "herdr-herd", "TTL": "21600"}  # 6h TTL, collapse key
     await asyncio.to_thread(_deliver_push, payload, headers)
+
+
+async def maybe_push_blocked(rec: dict, content: str):
+    """Notify on a new human attention class, not merely on a new terminal repaint.
+
+    Called on every blocked poll and event. The internal -> stalled transition therefore reaches
+    the phone even when prompt_id and selected options have not changed. Re-broadcasting the same
+    audience remains one-shot, and both event paths share this ledger.
+    """
+    pane_id = rec.get("pane_id", "")
+    if not pane_id:
+        return
+    kind = None
+    if audience.notify_blocked(rec):
+        kind = (rec.get("hp_audience") or "blocked") if rec.get("hp_role") == "thread" else "blocked"
+    previous = last_push_audience.get(pane_id)
+    if previous == kind:
+        return
+    if kind is None:
+        last_push_audience.pop(pane_id, None)
+        return
+    # Claim before awaiting: a session switch during delivery clears the ledger, and completion of
+    # this old send must not seed the old pane's audience into the newly selected session.
+    last_push_audience[pane_id] = kind
+    project = audience.effective_project(rec)
+    await send_web_push(
+        title=(f"\U0001f411 {project} thread stalled" if kind == "stalled"
+               else f"\U0001f411 {project} blocked"),
+        body=content[:120],
+        url=f"/?pane={pane_id}",
+    )
 
 _load_push_subs()
 _load_active_sessions()
@@ -1578,6 +1625,7 @@ def update_pane_maps(agents, shells=()):
             pane_session_map.pop(pane_id, None)
             last_statuses.pop(pane_id, None)
             last_blocked_prompts.pop(pane_id, None)
+            last_push_audience.pop(pane_id, None)
             agent_cache.pop(pane_id, None)
             shell_pane_map.pop(pane_id, None)
     # Last, so the records carry whatever this call just seeded or bumped.
@@ -1610,6 +1658,7 @@ def reset_pane_state():
     pane_remote_map.clear()
     last_statuses.clear()
     last_blocked_prompts.clear()
+    last_push_audience.clear()
     _session_list_cache.clear()
     while True:
         try:
@@ -3051,16 +3100,13 @@ async def _poll_once():
                     last_blocked_prompts[pid] = fingerprint
                     log.info("Blocked (poll) pane=%s update=%s", pid, message["update"])
                     await broadcast(message)
-                    # Clients still need every re-broadcast (the prompt_id they must echo back
-                    # to approve moves with the content), but the notification is one-shot.
-                    if not message["update"]:
-                        await send_web_push(
-                            title=f"\U0001f411 {a['project']} blocked",
-                            body=content[:120],
-                            url=f"/?pane={pid}",
-                        )
-                    if gen != POLL_GENERATION:
-                        return
+                # Audience changes are independent of prompt repaints: an unchanged internal
+                # question can become stalled, and that transition still has to notify.
+                if gen != POLL_GENERATION:
+                    return
+                await maybe_push_blocked(a, content)
+                if gen != POLL_GENERATION:
+                    return
             else:
                 # No clear push. A subscription is taken out with userVisibleOnly: true, which
                 # is a contract: every push it carries must end in a notification the reader can
@@ -3077,6 +3123,7 @@ async def _poll_once():
                 # the next block replaces it in place, and tapping it closes it. That is a far
                 # smaller cost than losing the channel.
                 last_blocked_prompts.pop(pid, None)
+                last_push_audience.pop(pid, None)
             last_statuses[pid] = status
 async def event_push():
     while True:
@@ -3162,12 +3209,8 @@ async def event_push():
             )
             log.info("Blocked (event) pane=%s update=%s", pane_id, message["update"])
             await broadcast(message)
-            if not message["update"]:
-                await send_web_push(
-                    title=f"\U0001f411 {agent_data.get('project', '')} blocked",
-                    body=(content or agent_data.get("prompt", ""))[:120],
-                    url=f"/?pane={pane_id}",
-                )
+            push_agent = {**agent_cache.get(pane_id, {}), **agent_data}
+            await maybe_push_blocked(push_agent, content or agent_data.get("prompt", ""))
 
 
 WEB_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "web"))

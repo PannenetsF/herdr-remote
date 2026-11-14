@@ -123,6 +123,14 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .theme-seg button[aria-checked="true"] { background: var(--text); border-color: var(--text); color: var(--bg); }
 
 
+/* The human/raw projection is a view choice, not another herdr workspace. */
+.view-switch { display: flex; gap: 4px; margin: 0 0 8px; padding: 3px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg); }
+.view-switch button { flex: 1; min-height: 32px; border: 0; border-radius: 7px; background: transparent; color: var(--muted); font: 600 0.75rem var(--font-mono); cursor: pointer; }
+.view-switch button.active { background: var(--text); color: var(--bg); }
+.project-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 12px 3px 6px; color: var(--muted); font-size: 0.7rem; font-weight: 600; }
+.project-heading > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-heading .sec-count { flex: none; font-weight: 400; opacity: 0.65; }
+
 /* Agent list */
 .agents { padding: 12px; }
 .section-header { font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; display: flex; align-items: center; gap: 5px; }

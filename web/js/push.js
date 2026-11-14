@@ -1,6 +1,17 @@
 // --- Web Push ---
 let pushSubscription = null;
 
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.addEventListener('message', event => {
+    if (event.data?.type !== 'navigate') return;
+    let url;
+    try { url = new URL(event.data.url || '/', location.href); } catch { return; }
+    if (url.origin !== location.origin || url.pathname !== '/') return;
+    const pane = url.searchParams.get('pane');
+    if (pane) requestPane(pane);
+  });
+}
+
 async function initPush() {
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
     document.getElementById('pushStatus').textContent = 'Push not supported in this browser';
