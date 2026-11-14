@@ -79,6 +79,9 @@ function handleMessage(msg) {
       };
     });
     agentsSnapshotReady = true;
+    // Reconcile worker-thread escalations onto their owning coordinator after the full snapshot is
+    // in place. This is the only path that chimes/timeline-records a thread, and once per project.
+    trackThreadAggregates(agents);
     openRequestedPane();
     render();
   }

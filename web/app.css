@@ -131,6 +131,10 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .project-heading > :first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .project-heading .sec-count { flex: none; font-weight: 400; opacity: 0.65; }
 
+/* Aggregate worker follow-ups on the owning coordinator card; no thread gets its own row. */
+.follow-badge { margin-left: 8px; padding: 1px 7px; border-radius: 999px; background: var(--red);
+  color: #fff; font-size: 0.62rem; font-weight: 700; white-space: nowrap; vertical-align: middle; }
+
 /* Agent list */
 .agents { padding: 12px; }
 .section-header { font-size: 0.7rem; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; color: var(--muted); margin: 16px 0 8px; display: flex; align-items: center; gap: 5px; }

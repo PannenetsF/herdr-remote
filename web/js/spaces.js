@@ -127,11 +127,13 @@ function viewSwitch() {
 }
 
 // The human herd has two levels of triage: the attention section, then the registered project.
-// Coordinator and hand-started session rows remain separate even when several belong to one
-// project. A thread becomes a row only after herdr-projects assigns it to the human.
+// Only coordinator/hand-started session panes are rows. Worker threads never get a card; their
+// human/stalled escalations are aggregated as a follow-up count on the owning coordinator.
 function renderProjectHerd() {
-  const visible = agents.filter(paneHuman);
-  const sections = triage(visible, recentDir, p => humanThread(p) ? 'needs' : bucketOf(p));
+  // Aggregate over the FULL snapshot: the follow-up counts live on worker panes that the filter
+  // below removes, so withFollowups must run before paneHuman or every badge would come back zero.
+  const visible = withFollowups(agents).filter(paneHuman);
+  const sections = triage(visible, recentDir, projectBucket);
   let html = '';
   for (const s of sections) {
     if (!s.panes.length) continue;
@@ -438,6 +440,7 @@ function switchHerdrSession(host, session) {
   agentsSnapshotReady = false;
   pendingPaneRequest = null;
   previousAttention = {};
+  previousFollowups = new Map();
   agents = [];
   render();
   ws.send(JSON.stringify({ type: 'session_switch', host, session }));

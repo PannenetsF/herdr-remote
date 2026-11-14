@@ -269,6 +269,10 @@ last_blocked_prompts = {}
 # herdr-projects upgrades its audience from internal to stalled, so prompt fingerprints alone are
 # not a sufficient notification ledger.
 last_push_audience = {}
+# project key (host|slug) -> the set of escalated worker pane ids already pushed for that project.
+# Worker threads never push on their own: a project's new human/stalled threads are coalesced into
+# one notification that deep-links the owning coordinator.
+last_push_project_followups = {}
 # (host, pane_id) -> does this idle pane hold a question. Keyed with the host like the activity
 # ledger, because every herdr numbers its own panes.
 question_panes = {}
@@ -856,34 +860,60 @@ async def send_web_push(title: str, body: str, url: str = "/", clear: bool = Fal
 
 
 async def maybe_push_blocked(rec: dict, content: str):
-    """Notify on a new human attention class, not merely on a new terminal repaint.
+    """Notify on a primary session's new block, not merely on a new terminal repaint.
 
-    Called on every blocked poll and event. The internal -> stalled transition therefore reaches
-    the phone even when prompt_id and selected options have not changed. Re-broadcasting the same
-    audience remains one-shot, and both event paths share this ledger.
+    Worker threads never reach this gate (audience.notify_blocked is primary-only); their
+    human/stalled escalations are coalesced per project in reconcile_project_followups instead.
+    Re-broadcasting the same block stays one-shot.
     """
     pane_id = rec.get("pane_id", "")
-    if not pane_id:
+    if not pane_id or not audience.notify_blocked(rec):
+        last_push_audience.pop(pane_id, None)
         return
-    kind = None
-    if audience.notify_blocked(rec):
-        kind = (rec.get("hp_audience") or "blocked") if rec.get("hp_role") == "thread" else "blocked"
+    kind = "blocked"
     previous = last_push_audience.get(pane_id)
     if previous == kind:
-        return
-    if kind is None:
-        last_push_audience.pop(pane_id, None)
         return
     # Claim before awaiting: a session switch during delivery clears the ledger, and completion of
     # this old send must not seed the old pane's audience into the newly selected session.
     last_push_audience[pane_id] = kind
     project = audience.effective_project(rec)
     await send_web_push(
-        title=(f"\U0001f411 {project} thread stalled" if kind == "stalled"
-               else f"\U0001f411 {project} blocked"),
+        title=f"\U0001f411 {project} blocked",
         body=content[:120],
         url=f"/?pane={pane_id}",
     )
+
+
+async def reconcile_project_followups(agents):
+    """Coalesce newly escalated worker threads into one coordinator push per (host, project).
+
+    Runs once per full snapshot. A batch of threads going human/stalled together notifies exactly
+    once and routes to the owning coordinator. A project with no live coordinator is skipped -- its
+    workers stay reachable through the raw All-panes stream and never get a standalone alert.
+    """
+    grouped = audience.project_followups(agents)
+    seen = set()
+    for key, threads in grouped.items():
+        seen.add(key)
+        coordinator = audience.primary_coordinator(agents, key)
+        if coordinator is None:
+            continue
+        current = {t.get("pane_id", "") for t in threads}
+        previous = last_push_project_followups.get(key)
+        if previous is not None and current <= previous:
+            continue
+        last_push_project_followups[key] = current
+        count = len(current)
+        noun = "thread follow-up" if count == 1 else "thread follow-ups"
+        await send_web_push(
+            title=f"\U0001f411 {audience.effective_project(coordinator)}: {count} {noun}",
+            body="Worker threads need review; opening routes to the coordinator.",
+            url=f"/?pane={coordinator.get('pane_id', '')}",
+        )
+    # Drop ledgers for projects that no longer hold escalations so a future escalation re-fires.
+    for stale in set(last_push_project_followups) - seen:
+        last_push_project_followups.pop(stale, None)
 
 _load_push_subs()
 _load_active_sessions()
@@ -1659,6 +1689,7 @@ def reset_pane_state():
     last_statuses.clear()
     last_blocked_prompts.clear()
     last_push_audience.clear()
+    last_push_project_followups.clear()
     _session_list_cache.clear()
     while True:
         try:
@@ -3125,6 +3156,13 @@ async def _poll_once():
                 last_blocked_prompts.pop(pid, None)
                 last_push_audience.pop(pid, None)
             last_statuses[pid] = status
+        if gen != POLL_GENERATION:
+            return
+        # One project-level reconciliation after every pane's block handling, so worker threads
+        # only ever notify as a coalesced follow-up count on their coordinator.
+        await reconcile_project_followups(agents)
+
+
 async def event_push():
     while True:
         event = await event_queue.get()

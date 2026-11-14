@@ -1185,9 +1185,13 @@ class HpRoleAudienceGateTests(unittest.TestCase):
                                    cwd="/Users/me/Documents/workspace"))
         )
 
-    def test_stalled_thread_worker_still_reaches_the_human(self):
-        stalled = _tok_rec("c", "thread", audience="stalled", label="hp-proj-t-0003")
-        self.assertTrue(tg.pane_human(stalled))
+    def test_no_thread_worker_ever_reaches_the_human_whatever_its_audience(self):
+        # pf.22: a worker thread is never its own row; human/stalled escalations are aggregated
+        # onto the owning coordinator by the relay, not surfaced as standalone Telegram rows.
+        for audience in ("internal", "human", "stalled"):
+            self.assertFalse(
+                tg.pane_human(_tok_rec("c", "thread", audience=audience,
+                                       label="hp-proj-t-0003")))
 
     def test_token_role_overrides_name_heuristic(self):
         # A coordinator-classified row never gets hidden by a thread-like cwd,

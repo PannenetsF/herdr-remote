@@ -95,9 +95,7 @@ function herdSecondary(p, project) {
 /** Line one, as spans. See paneParts for why it is not a string. */
 function titleHtml(p, scope, host) {
   if (scope === 'project') {
-    const role = p.hp_role === 'coordinator' ? 'Coordinator'
-      : p.hp_role === 'thread' ? (p.hp_audience === 'stalled' ? 'Stalled thread' : 'Thread follow-up')
-      : p.hp_role === 'session' ? 'Session' : 'Session';
+    const role = p.hp_role === 'coordinator' ? 'Coordinator' : 'Session';
     return `<span class="pane-project">${escapeHtml(p.label || threadName(p))}</span>`
       + `<span class="pane-sep"> · </span><span class="pane-tab">${escapeHtml(role)}</span>${host}`;
   }
@@ -112,6 +110,11 @@ function titleHtml(p, scope, host) {
 
 function secondaryOf(p, scope) {
   if (scope === 'project') {
+    // An owning coordinator leads with its worker follow-up count; the live title sits beneath.
+    if (p.ownsFollowups && p.followupCount) {
+      const noun = p.followupCount === 1 ? 'thread follow-up' : 'thread follow-ups';
+      return `${p.followupCount} ${noun}`;
+    }
     return p.title || informativeCwd(p, effectiveProject(p)) || p.pane_id;
   }
   return (scope === 'tab' ? paneTitleInTab(p) : paneParts(p)).secondary;
@@ -123,19 +126,17 @@ function hostHtml(p) {
 }
 
 function agentCard(a, scope) {
-  // A thread's herdr status can be idle while its report is waiting for review. Human escalation,
-  // not the worker's raw process state, determines its bucket in the project view.
-  const bucket = scope === 'project' && humanThread(a) ? 'needs' : bucketOf(a);
-  // A stalled question is the one deliberate direct route into a worker. Other thread follow-ups
-  // return to their coordinator; if it has already exited, the live thread remains the fallback.
-  let target = a.pane_id;
-  if (scope === 'project' && a.hp_role === 'thread' && a.hp_audience !== 'stalled') {
-    const coordinator = agents.find(p => p.hp_role === 'coordinator' && projectKey(p) === projectKey(a));
-    if (coordinator) target = coordinator.pane_id;
-  }
+  // In Projects the bucket already accounts for aggregated worker follow-ups (projectBucket); a
+  // coordinator is never faked into a process-blocked state, it simply owns a Needs-you aggregate.
+  const bucket = scope === 'project' ? projectBucket(a) : bucketOf(a);
+  // Projects rows are primary sessions only and always open their own pane. Worker threads are
+  // reachable exclusively through All panes.
+  const target = a.pane_id;
   const pulseClass = a.status === 'working' ? ' pulse' : '';
   const named = paneName(a);
   const secondary = secondaryOf(a, scope);
+  const followBadge = scope === 'project' && a.ownsFollowups && a.followupCount
+    ? `<span class="follow-badge" aria-label="${a.followupCount} thread follow-ups">${a.followupCount} follow-up${a.followupCount === 1 ? '' : 's'}</span>` : '';
   // The harness stays on line two. Collie can drop it because its rows carry an agent avatar; this
   // page has none, so the only place `claude` is written is here.
   const meta = [escapeHtml(a.agent), secondary ? escapeHtml(secondary) : '']
@@ -144,9 +145,9 @@ function agentCard(a, scope) {
   // escapes any JS string it is interpolated into -- HTML-escaping it does not help, because the
   // browser decodes the attribute before it parses the handler. The id travels as data only, and
   // bindRowHandlers wires the click and the Enter/Space from the dataset.
-  return `<div class="agent${bucket === 'needs' ? ' blocked' : ''}${bucket === 'ready' ? ' ready' : ''}${a.focused ? ' focused' : ''}" role="button" tabindex="0" aria-label="${escapeAttr(named)}, ${TRIAGE_META[bucket].label}${target !== a.pane_id ? ', opens coordinator' : ''}${a.focused ? ', focused in herdr' : ''}" data-pane-id="${escapeAttr(target)}" data-source-pane-id="${escapeAttr(a.pane_id)}" data-agent-name="${escapeAttr(named)}" data-bucket="${bucket}">
+  return `<div class="agent${bucket === 'needs' ? ' blocked' : ''}${bucket === 'ready' ? ' ready' : ''}${a.focused ? ' focused' : ''}" role="button" tabindex="0" aria-label="${escapeAttr(named)}, ${TRIAGE_META[bucket].label}${a.focused ? ', focused in herdr' : ''}" data-pane-id="${escapeAttr(target)}" data-source-pane-id="${escapeAttr(a.pane_id)}" data-agent-name="${escapeAttr(named)}" data-bucket="${bucket}">
     <span class="dot${pulseClass}" style="background:${TRIAGE_COLOR[bucket]}" aria-hidden="true"></span>
-    <div class="info"><div class="project">${titleHtml(a, scope, hostHtml(a))}</div><div class="meta">${meta}</div></div>
+    <div class="info"><div class="project">${titleHtml(a, scope, hostHtml(a))}${followBadge}</div><div class="meta">${meta}</div></div>
     <span style="color:var(--muted);font-size:1.2rem" aria-hidden="true">›</span>
   </div>`;
 }
