@@ -146,6 +146,18 @@ else
   PASS=$((PASS+1)); echo "  skip: not present"
 fi
 
+# --- Edge login sidecar ---
+echo ""
+echo "=== Edge login sidecar ==="
+echo "14b. herdr web login sidecar behaviour"
+if [ -f "$DIR/deploy/herdr-web-login/auth.py" ]; then
+  (cd "$DIR/deploy/herdr-web-login" && "$PYTHON" -m unittest discover -s . -p "test_*.py")
+  assert_eq "$?" "0" "login sidecar tests pass"
+  rm -rf "$DIR/deploy/herdr-web-login/__pycache__"
+else
+  PASS=$((PASS+1)); echo "  skip: sidecar not present"
+fi
+
 # --- Integration ---
 echo ""
 echo "=== Integration ==="
