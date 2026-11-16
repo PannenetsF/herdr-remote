@@ -509,6 +509,21 @@ function openTerminal(paneId) {
   // the relay doesn't report it, and the button stays. A terminal never has one.
   const historyBtn = document.querySelector('.history-btn');
   if (historyBtn) historyBtn.style.display = (shell || (a && a.has_session === false)) ? 'none' : '';
+  // The Chat view is a per-host instance, and the one behind webUiUrl serves the relay's `local`
+  // host only: pane ids from any other host do not exist there, so no link is offered for them.
+  const chatLink = document.getElementById('chatLink');
+  if (chatLink) {
+    const host = (a && a.host) || 'local';
+    const usable = !shell && webUiUrl && host === 'local';
+    chatLink.style.display = usable ? '' : 'none';
+    if (usable) {
+      // `view=chat` is the web-ui's own lens parameter (src/lib/deepLink.ts), so the link opens
+      // on the transcript rather than the terminal.
+      chatLink.href = `${webUiUrl}/?pane=${encodeURIComponent(paneId)}&view=chat`;
+    } else {
+      chatLink.removeAttribute('href');
+    }
+  }
   renderSiblings();
   document.getElementById('agentListView').style.display = 'none';
   if (refreshInterval) clearInterval(refreshInterval);

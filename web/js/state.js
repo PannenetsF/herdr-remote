@@ -68,6 +68,13 @@ function openRequestedPane() {
 // themselves are all there is to group by.
 let spaces = {workspaces: [], tabs: []};
 
+// The pane-level Chat view lives in the herdr-web-ui plugin, not in this app: it is a different
+// front end (native Chat|Terminal switch, approvals as cards) that reads the same pane. It runs
+// per host, so a link is only offered for panes whose host that instance owns. Empty hides the
+// link everywhere; `herdr_webui_url` in localStorage overrides the default per browser.
+const DEFAULT_WEBUI_URL = 'http://[2605:340:cd51:2a01:0:2b13:f279:c096]:8080';
+const webUiUrl = (localStorage.getItem('herdr_webui_url') || DEFAULT_WEBUI_URL).replace(/\/+$/, '');
+
 // Settings — auto-detect relay when served from same origin
 const autoRelayUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
 const DEMO_RELAY = 'wss://herdr-remote-demo.yyrzrh5wfg.workers.dev';

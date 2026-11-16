@@ -288,6 +288,8 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
    state to compare it against. Driven by `aria-pressed` so the pixels and the screen reader
    cannot disagree, and the off state keeps a transparent border so nothing shifts when it fills. */
 .term-header .icon-toggle { background: none; border: 1px solid transparent; border-radius: 7px; color: var(--muted); cursor: pointer; padding: 4px; display: flex; align-items: center; }
+/* The Chat link is an anchor, so it needs the anchor chrome removed to sit level with the buttons. */
+.term-header a.icon-toggle { text-decoration: none; }
 .term-header .icon-toggle:hover, .term-header .refresh-btn:hover { color: var(--text); }
 .term-header .icon-toggle[aria-pressed="true"] { background: var(--text); border-color: var(--text); color: var(--bg); }
 /* The open pane's reachable neighbours, split by the relation that matters: a tabmate is a pane
